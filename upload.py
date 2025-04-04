@@ -3,8 +3,13 @@ import argparse
 import requests
 from requests.auth import HTTPBasicAuth
 
-def post_files(base_url, directory, auth=None):
-    files = sorted(f for f in os.listdir(directory) if f.endswith(".json"))
+def post_files(base_url, directory, auth=None, resource_type_filter=None):
+    files = sorted(f for f in os.listdir(directory)
+                   if f.endswith(".json") and (resource_type_filter is None or f.startswith(f"{resource_type_filter}-")))
+
+    if not files:
+        print(f"[INFO] No files found for resource type: {resource_type_filter}")
+        return
 
     for filename in files:
         filepath = os.path.join(directory, filename)
@@ -33,10 +38,11 @@ def main():
     parser.add_argument('--host', required=True, help='Base URL of the FHIR server including /fhir (e.g. https://example.com/fhir)')
     parser.add_argument('--user', help='Username for basic auth')
     parser.add_argument('--password', help='Password for basic auth')
+    parser.add_argument('--type', help='Optional FHIR resource type to filter uploads (e.g. AllergyIntolerance)')
     args = parser.parse_args()
 
     auth = HTTPBasicAuth(args.user, args.password) if args.user and args.password else None
-    post_files(args.host.rstrip("/"), args.data, auth)
+    post_files(args.host.rstrip("/"), args.data, auth, args.type)
 
 if __name__ == "__main__":
     main()

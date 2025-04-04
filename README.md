@@ -20,9 +20,9 @@ pip3 install -r requirements.txt
 
 ## Running
 
-`python upload.py --data ./fhir-data --host https://your.fhir.server/fhir --user yourusername --password yourpassword`
+`python upload.py --data ./fhir-data --host https://your.fhir.server/fhir --user yourusername --password yourpassword --type ResourceType (optional)`
 
 ## Note
 Linkages between resources may cause failures if the linked resource doesn't exist first and your FHIR server performs validation.
-Running the full set of resources again should be resolve the linked resources - hopefully the existing ones will be rejected, and the new ones added.
+Running the full set of resources again a few times should be resolve the linked resources - hopefully the existing ones will be rejected, and the new ones added.
 Ensure your FHIR server is idempotent :)
