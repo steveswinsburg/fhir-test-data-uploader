@@ -72,6 +72,10 @@ fi
 echo "Activating virtual environment..."
 source venv/bin/activate
 
+# Clear pip cache to avoid deserialization issues
+echo "Clearing pip cache..."
+pip3 cache purge --quiet 2>/dev/null || true
+
 # Upgrade pip to latest version (suppress warnings)
 echo "Upgrading pip to latest version..."
 pip3 install --upgrade pip --quiet
