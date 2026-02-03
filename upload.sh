@@ -72,6 +72,10 @@ fi
 echo "Activating virtual environment..."
 source venv/bin/activate
 
+# Upgrade pip to latest version (suppress warnings)
+echo "Upgrading pip to latest version..."
+pip3 install --upgrade pip --quiet
+
 # Install required packages
 echo "Installing dependencies..."
 pip3 install -r requirements.txt
