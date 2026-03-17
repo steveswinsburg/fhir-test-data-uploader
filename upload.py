@@ -13,6 +13,9 @@ def put_files(base_url, directory, auth=None, resource_type_filter=None):
         return
 
     for filename in files:
+
+        print(f"[INFO] Handling {filename}")
+
         filepath = os.path.join(directory, filename)
         # Extract resource type and ID from filename
         # Example: Patient-dietrich-kimbra-althea.json -> type=Patient, id=dietrich-kimbra-althea
