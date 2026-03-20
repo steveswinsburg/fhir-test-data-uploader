@@ -114,17 +114,17 @@ def topological_sort_files(dependency_map):
 
 
 def put_files(base_url, directory, auth=None, resource_type_filter=None):
-    print("Building dependency map... \n")
+    print("🛠️  Building dependency map... \n")
     dependency_map = build_dependency_map(directory, resource_type_filter)
 
-    print("Topologically sorting files... \n")
+    print("🔀 Topologically sorting files... \n")
     sorted_files = topological_sort_files(dependency_map)
 
     if not sorted_files:
         print(f"[INFO] No files found for resource type: {resource_type_filter}")
         return
 
-    print("Uploading files...\n")
+    print("⬆️  Uploading files...\n")
     for filename in sorted_files:
         meta = dependency_map[filename]
         if meta["loaded"]:
@@ -135,14 +135,14 @@ def put_files(base_url, directory, auth=None, resource_type_filter=None):
         resource_type = meta["resourceType"]
         resource_id = meta["id"]
         if not resource_type or not resource_id:
-            print(f"[WARNING] Skipping {filename}: Missing resourceType or id")
+            print(f"⚠️ [WARNING] Skipping {filename}: Missing resourceType or id")
             continue
         url = f"{base_url}/{resource_type}/{resource_id}"
         try:
             with open(filepath, 'r', encoding='utf-8') as file:
                 json_data = json.load(file)
         except Exception as e:
-            print(f"[ERROR] Failed to parse {filename}: {e}")
+            print(f"❌ [ERROR] Failed to parse {filename}: {e}")
             continue
         # Ensure ID and resourceType are correct
         if json_data.get('id') != resource_id:
@@ -156,16 +156,15 @@ def put_files(base_url, directory, auth=None, resource_type_filter=None):
                 headers={"Content-Type": "application/fhir+json"},
                 auth=auth
             )
-            print(f"[INFO] PUT {filename} to {url} - Status: {response.status_code}")
+            print(f"✅ [INFO] PUT {filename} to {url} - Status: {response.status_code}")
             if response.ok:
                 dependency_map[filename]["loaded"] = True
             else:
-                print(f"[ERROR] Response: {response.text}")
+                print(f"❌ [ERROR] Response: {response.text}")
         except Exception as e:
-            print(f"[ERROR] Failed to PUT {filename}: {e}")
+            print(f"❌ [ERROR] Failed to PUT {filename}: {e}")
 
-    print("\nUpload process completed.")
-
+    print("\n🎉 Upload process complete.\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Upload FHIR JSON files to a server.")
