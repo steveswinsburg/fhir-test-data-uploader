@@ -9,6 +9,7 @@ HOST=""
 USER=""
 PASSWORD=""
 TYPE=""
+DEBUG=false
 
 # Parse named parameters
 while [[ $# -gt 0 ]]; do
@@ -34,9 +35,13 @@ while [[ $# -gt 0 ]]; do
       TYPE="$2"
       shift 2
       ;;
+    --debug)
+      DEBUG=true
+      shift 1
+      ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: $0 --data <directory> --host <fhir-server-url> [--user <username>] [--password <password>] [--type <resource-type>]"
+      echo "Usage: $0 --data <directory> --host <fhir-server-url> [--user <username>] [--password <password>] [--type <resource-type>] [--debug]"
       exit 1
       ;;
   esac
@@ -44,7 +49,7 @@ done
 
 # Check required parameters
 if [ -z "$DATA" ] || [ -z "$HOST" ]; then
-  echo "Usage: $0 --data <directory> --host <fhir-server-url> [--user <username>] [--password <password>] [--type <resource-type>]"
+  echo "Usage: $0 --data <directory> --host <fhir-server-url> [--user <username>] [--password <password>] [--type <resource-type>] [--debug]"
   echo ""
   echo "Required:"
   echo "  --data      Directory containing FHIR JSON files"
@@ -54,10 +59,11 @@ if [ -z "$DATA" ] || [ -z "$HOST" ]; then
   echo "  --user      Username for basic auth"
   echo "  --password  Password for basic auth"
   echo "  --type      FHIR resource type to filter uploads (e.g. Patient, AllergyIntolerance)"
+  echo "  --debug     Enable debug mode"
   echo ""
   echo "Examples:"
   echo "  $0 --data ./test-data --host http://localhost:8080/fhir"
-  echo "  $0 --data ./test-data --host https://fhir.example.com/fhir --user admin --password secret"
+  echo "  $0 --data ./test-data --host https://fhir.example.com/fhir --user admin --password secret --debug"
   echo "  $0 --data ./test-data --host http://localhost:8080/fhir --type Patient"
   exit 1
 fi
@@ -99,8 +105,11 @@ if [ ! -z "$TYPE" ]; then
   PYTHON_CMD="$PYTHON_CMD --type \"$TYPE\""
 fi
 
-echo "Uploading FHIR data..."
-echo "Command: $PYTHON_CMD"
+if [ "$DEBUG" = true ]; then
+  PYTHON_CMD="$PYTHON_CMD --debug"
+fi
+
+echo -e "\nCommand: $PYTHON_CMD"
 echo ""
 
 # Run the upload script
