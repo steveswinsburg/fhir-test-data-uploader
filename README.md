@@ -1,12 +1,15 @@
 # 🏥 FHIR Test Data Uploader
 
-A Python utility for uploading FHIR JSON files to FHIR servers using PUT requests with specific resource IDs. This tool is designed to help you quickly populate FHIR servers with test data for development, testing, and demonstration purposes.
+A Python utility for uploading FHIR JSON / NDJSON files to FHIR servers using PUT requests with specific resource IDs. This tool is designed to help you quickly populate FHIR servers with test data for development, testing, and demonstration purposes.
 
 ## ✨ Features
 
 - 📁 Batch upload multiple FHIR JSON files
+- 📄 Streaming support for NDJSON files 
 - 🔒 Support for Basic Authentication
 - 🎯 Optional filtering by FHIR resource type
+- 🧭 Automatic resource-type order inference from sampled references
+- 📚 Explicit resource-type upload ordering for dependency-sensitive loads
 - 📊 Progress reporting with status codes
 - 🔄 Automatic resource type and ID detection from filename
 - 🆔 PUT requests with specific resource IDs (not server-generated)
@@ -55,7 +58,11 @@ python upload.py --data ./your-fhir-data --host http://localhost:8080/fhir
 
 ## 📁 Data Format Requirements
 
-Your FHIR JSON files must follow this naming convention:
+Your FHIR resource files can be provided as either individual JSON resources or NDJSON streams.
+
+### Individual JSON Files
+
+Individual FHIR JSON files must follow this naming convention:
 ```
 ResourceType-identifier.json
 ```
@@ -71,6 +78,19 @@ The script automatically:
 - Extracts the resource ID from everything after the first dash
 - Uses PUT requests to `/ResourceType/ID` endpoints
 - Ensures the JSON `id` field matches the URL ID
+
+### NDJSON Files
+
+NDJSON files are also supported and will be streamed.
+
+Recommended naming conventions:
+```
+Patient.ndjson
+Patient-part1.ndjson
+Observation.ndjson
+```
+
+Each line must contain a complete FHIR resource.
 
 ## 🏃‍♂️ Usage
 
@@ -94,6 +114,17 @@ The `upload.sh` script handles virtual environment setup and dependency installa
   --data ./fhir-data \
   --host http://localhost:8080/fhir \
   --type Patient
+
+# Let the uploader infer resource-type order automatically
+./upload.sh \
+  --data ./fhir-data \
+  --host http://localhost:8080/fhir
+
+# Override the inferred order with an explicit dependency order
+./upload.sh \
+  --data ./fhir-data \
+  --host http://localhost:8080/fhir \
+  --type-order Patient,Practitioner,Organization,Encounter,Observation
 
 # Example with local HAPI FHIR server
 ./upload.sh --data ../au-fhir-test-data/au-core --host http://localhost:8080/fhir
@@ -120,6 +151,17 @@ python upload.py \
   --data ./fhir-data \
   --host https://your.fhir.server/fhir \
   --type Patient
+
+# Let the uploader infer resource-type order automatically
+python upload.py \
+  --data ./fhir-data \
+  --host https://your.fhir.server/fhir
+
+# Override the inferred order with an explicit dependency order
+python upload.py \
+  --data ./fhir-data \
+  --host https://your.fhir.server/fhir \
+  --type-order Patient,Practitioner,Organization,Encounter,Observation
 ```
 
 ### Command Line Arguments
@@ -131,6 +173,7 @@ python upload.py \
 | `--user` | ❌ | Username for Basic Authentication | `admin` |
 | `--password` | ❌ | Password for Basic Authentication | `password123` |
 | `--type` | ❌ | Filter uploads to specific resource type | `Patient` |
+| `--type-order` | ❌ | Comma-separated resource types to upload in order | `Patient,Practitioner,Observation` |
 
 ### Shell Script Features
 
@@ -145,11 +188,14 @@ The `upload.sh` script provides additional conveniences:
 
 FHIR resources often reference other resources (e.g., Observations reference Patients). If your FHIR server validates references:
 
-1. **Upload in dependency order**: Upload referenced resources first (Patients, Practitioners) before dependent resources (Observations, AllergyIntolerances)
+1. **Use the default inferred order**: When uploading a whole directory, the tool samples a few resources from each file and infers a resource-type order from the references it finds
 2. **Multiple passes**: Run the upload script multiple times - previously failed resources may succeed once their dependencies exist
 3. **Server idempotency**: Ensure your FHIR server handles duplicate submissions gracefully
+4. **Override when needed**: Use `--type-order` if you already know the desired order or want to override the inferred one
 
 ### Recommended Upload Order
+
+The inferred order should usually handle this automatically, but a common manual order is:
 
 1. `Patient` resources
 2. `Practitioner` resources  
@@ -167,6 +213,8 @@ FHIR resources often reference other resources (e.g., Observations reference Pat
 - **FHIR Version**: Designed for FHIR R4
 - **Content Type**: Uses `application/fhir+json` header
 - **ID Validation**: Ensures JSON `id` field matches the filename-derived ID
+- **NDJSON Logging**: Large NDJSON uploads report periodic progress instead of logging every resource
+- **Order Inference**: Automatic ordering is based on sampled references, so unusual or late-appearing dependencies may still require `--type-order` or a second pass
 
 ## 🛠️ Troubleshooting
 

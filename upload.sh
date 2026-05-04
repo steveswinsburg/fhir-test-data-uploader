@@ -1,116 +1,21 @@
 #!/bin/bash
 
-# Exit on any error
-set -e
+set -euo pipefail
 
-# Default values
-DATA=""
-HOST=""
-USER=""
-PASSWORD=""
-TYPE=""
-DEBUG=false
-
-# Parse named parameters
-while [[ $# -gt 0 ]]; do
-  key="$1"
-  case $key in
-    --data)
-      DATA="$2"
-      shift 2
-      ;;
-    --host)
-      HOST="$2"
-      shift 2
-      ;;
-    --user)
-      USER="$2"
-      shift 2
-      ;;
-    --password)
-      PASSWORD="$2"
-      shift 2
-      ;;
-    --type)
-      TYPE="$2"
-      shift 2
-      ;;
-    --debug)
-      DEBUG=true
-      shift 1
-      ;;
-    *)
-      echo "Unknown option: $1"
-      echo "Usage: $0 --data <directory> --host <fhir-server-url> [--user <username>] [--password <password>] [--type <resource-type>] [--debug]"
-      exit 1
-      ;;
-  esac
-done
-
-# Check required parameters
-if [ -z "$DATA" ] || [ -z "$HOST" ]; then
-  echo "Usage: $0 --data <directory> --host <fhir-server-url> [--user <username>] [--password <password>] [--type <resource-type>] [--debug]"
-  echo ""
-  echo "Required:"
-  echo "  --data      Directory containing FHIR JSON files"
-  echo "  --host      Base URL of the FHIR server including /fhir (e.g. http://localhost:8080/fhir)"
-  echo ""
-  echo "Optional:"
-  echo "  --user      Username for basic auth"
-  echo "  --password  Password for basic auth"
-  echo "  --type      FHIR resource type to filter uploads (e.g. Patient, AllergyIntolerance)"
-  echo "  --debug     Enable debug mode"
-  echo ""
-  echo "Examples:"
-  echo "  $0 --data ./test-data --host http://localhost:8080/fhir"
-  echo "  $0 --data ./test-data --host https://fhir.example.com/fhir --user admin --password secret --debug"
-  echo "  $0 --data ./test-data --host http://localhost:8080/fhir --type Patient"
-  exit 1
-fi
+VENV_DIR="venv"
+PYTHON_BIN="$VENV_DIR/bin/python"
 
 # Create virtual environment if it doesn't exist
-if [ ! -d "venv" ]; then
+if [ ! -d "$VENV_DIR" ]; then
   echo "Creating Python virtual environment..."
-  python3 -m venv venv
+  python3 -m venv "$VENV_DIR"
 fi
-
-# Activate the virtual environment
-echo "Activating virtual environment..."
-source venv/bin/activate
-
-# Clear pip cache to avoid deserialization issues
-echo "Clearing pip cache..."
-pip3 cache purge --quiet 2>/dev/null || true
-
-# Upgrade pip to latest version (suppress warnings)
-echo "Upgrading pip to latest version..."
-pip3 install --upgrade pip --quiet
 
 # Install required packages
 echo "Installing dependencies..."
-pip3 install -r requirements.txt
+"$PYTHON_BIN" -m pip install -r requirements.txt
 
-# Build the python command with arguments
-PYTHON_CMD="python3 upload.py --data \"$DATA\" --host \"$HOST\""
-
-if [ ! -z "$USER" ]; then
-  PYTHON_CMD="$PYTHON_CMD --user \"$USER\""
-fi
-
-if [ ! -z "$PASSWORD" ]; then
-  PYTHON_CMD="$PYTHON_CMD --password \"$PASSWORD\""
-fi
-
-if [ ! -z "$TYPE" ]; then
-  PYTHON_CMD="$PYTHON_CMD --type \"$TYPE\""
-fi
-
-if [ "$DEBUG" = true ]; then
-  PYTHON_CMD="$PYTHON_CMD --debug"
-fi
-
-echo -e "\nCommand: $PYTHON_CMD"
+echo -e "\nCommand: $PYTHON_BIN upload.py $*"
 echo ""
 
-# Run the upload script
-eval $PYTHON_CMD
+exec "$PYTHON_BIN" upload.py "$@"
