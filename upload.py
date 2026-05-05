@@ -70,7 +70,7 @@ def parse_reference_type(reference):
     return resource_type
 
 
-def upload_resource(base_url, json_data, auth=None, source_label=None, verbose=True):
+def upload_resource(base_url, json_data, auth=None, source_label=None):
     resource_type = json_data.get("resourceType")
     resource_id = json_data.get("id")
 
@@ -90,7 +90,7 @@ def upload_resource(base_url, json_data, auth=None, source_label=None, verbose=T
         print(f"❌ [ERROR] Failed to PUT {source_label or f'{resource_type}/{resource_id}'}: {e}")
         return False
 
-    if verbose:
+    if DEBUG:
         print(f"✅ [INFO] PUT {source_label or f'{resource_type}/{resource_id}'} to {url} - Status: {response.status_code}")
 
     if not response.ok:
@@ -374,12 +374,12 @@ def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None):
                 continue
 
             source_label = f"{filename}:{line_number}"
-            if upload_resource(base_url, json_data, auth=auth, source_label=source_label, verbose=False):
+            if upload_resource(base_url, json_data, auth=auth, source_label=source_label):
                 uploaded += 1
             else:
                 failed += 1
 
-            if processed % NDJSON_PROGRESS_INTERVAL == 0:
+            if not DEBUG and processed % NDJSON_PROGRESS_INTERVAL == 0:
                 print(
                     f"[INFO] {filename}: processed={processed}, uploaded={uploaded}, failed={failed}, skipped={skipped}"
                 )
