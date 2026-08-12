@@ -8,7 +8,7 @@ A Python utility for uploading FHIR JSON / NDJSON files to FHIR servers using PU
 - 📄 Streaming support for NDJSON files 
 - 🔒 Support for Basic Authentication
 - 🎯 Optional filtering by FHIR resource type
-- 🧭 Automatic resource-type order inference from sampled references
+- 🧭 Automatic resource-type order inference from references (full scan by default, sampling optional)
 - 📚 Explicit resource-type upload ordering for dependency-sensitive loads
 - 📊 Progress reporting with status codes
 - 🔄 Automatic resource type and ID detection from filename
@@ -126,6 +126,19 @@ The `upload.sh` script handles virtual environment setup and dependency installa
   --host http://localhost:8080/fhir \
   --type-order Patient,Practitioner,Organization,Encounter,Observation
 
+# Faster inference on huge NDJSON datasets (sampling mode)
+./upload.sh \
+  --data ./fhir-data \
+  --host http://localhost:8080/fhir \
+  --type-order-scan-mode sample \
+  --type-order-sample-size 1000
+
+# Enable verbose debug logging
+./upload.sh \
+  --data ./fhir-data \
+  --host http://localhost:8080/fhir \
+  --debug
+
 # Example with local HAPI FHIR server
 ./upload.sh --data ../au-fhir-test-data/au-core --host http://localhost:8080/fhir
 ```
@@ -162,6 +175,19 @@ python upload.py \
   --data ./fhir-data \
   --host https://your.fhir.server/fhir \
   --type-order Patient,Practitioner,Organization,Encounter,Observation
+
+# Faster inference on huge NDJSON datasets (sampling mode)
+python upload.py \
+  --data ./fhir-data \
+  --host https://your.fhir.server/fhir \
+  --type-order-scan-mode sample \
+  --type-order-sample-size 1000
+
+# Enable verbose debug logging
+python upload.py \
+  --data ./fhir-data \
+  --host https://your.fhir.server/fhir \
+  --debug
 ```
 
 ### Command Line Arguments
@@ -174,6 +200,13 @@ python upload.py \
 | `--password` | ❌ | Password for Basic Authentication | `password123` |
 | `--type` | ❌ | Filter uploads to specific resource type | `Patient` |
 | `--type-order` | ❌ | Comma-separated resource types to upload in order | `Patient,Practitioner,Observation` |
+| `--type-order-scan-mode` | ❌ | NDJSON dependency inference mode when `--type-order` is not provided: `full` (default) or `sample` | `sample` |
+| `--type-order-sample-size` | ❌ | Per-file sample size used when `--type-order-scan-mode=sample` | `1000` |
+| `--debug` | ❌ | Enable verbose debug logging | `--debug` |
+
+Notes:
+- `--type` and `--type-order` cannot be used together.
+- `--type-order-sample-size` must be greater than `0` when `--type-order-scan-mode=sample`.
 
 ### Shell Script Features
 
@@ -188,7 +221,7 @@ The `upload.sh` script provides additional conveniences:
 
 FHIR resources often reference other resources (e.g., Observations reference Patients). If your FHIR server validates references:
 
-1. **Use the default inferred order**: When uploading a whole directory, the tool samples a few resources from each file and infers a resource-type order from the references it finds
+1. **Use the default inferred order**: When uploading a whole directory with NDJSON present, the tool infers resource-type order from references (full scan by default)
 2. **Multiple passes**: Run the upload script multiple times - previously failed resources may succeed once their dependencies exist
 3. **Server idempotency**: Ensure your FHIR server handles duplicate submissions gracefully
 4. **Override when needed**: Use `--type-order` if you already know the desired order or want to override the inferred one
@@ -214,7 +247,7 @@ The inferred order should usually handle this automatically, but a common manual
 - **Content Type**: Uses `application/fhir+json` header
 - **ID Validation**: Ensures JSON `id` field matches the filename-derived ID
 - **NDJSON Logging**: Large NDJSON uploads report periodic progress instead of logging every resource
-- **Order Inference**: Automatic ordering is based on sampled references, so unusual or late-appearing dependencies may still require `--type-order` or a second pass
+- **Order Inference Mode**: Default is `--type-order-scan-mode full` for maximum dependency-detection accuracy; use `sample` for faster inference on very large datasets
 
 ## 🛠️ Troubleshooting
 

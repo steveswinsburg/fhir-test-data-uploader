@@ -8,6 +8,7 @@ from collections import deque
 DEBUG = False
 NDJSON_PROGRESS_INTERVAL = 1000
 TYPE_ORDER_SAMPLE_SIZE = 5
+TYPE_ORDER_SCAN_MODE = "full"
 
 
 def matches_resource_type_filter(filename, resource_type_filter=None):
@@ -153,8 +154,10 @@ def topological_sort_files(dependency_map):
         if meta["resourceType"] and meta["id"]:
             id_to_file[(meta["resourceType"], meta["id"])] = fname
 
-    # Build adjacency list: file -> set of files it depends on
+    # Build adjacency list: dependency file -> set of files that depend on it
     adj = {fname: set() for fname in dependency_map}
+    in_degree = {fname: 0 for fname in dependency_map}
+
     for fname, meta in dependency_map.items():
         for ref in meta["references"]:
             # Only handle local references (ResourceType/id)
@@ -162,23 +165,21 @@ def topological_sort_files(dependency_map):
                 ref_type, ref_id = ref.split("/", 1)
                 dep_fname = id_to_file.get((ref_type, ref_id))
                 if dep_fname:
-                    adj[fname].add(dep_fname)
+                    # dep_fname must be uploaded before fname
+                    if fname not in adj[dep_fname]:
+                        adj[dep_fname].add(fname)
+                        in_degree[fname] += 1
 
-    # Kahn's algorithm for topological sort
-    in_degree = {fname: 0 for fname in dependency_map}
-    for deps in adj.values():
-        for dep in deps:
-            in_degree[dep] += 1
-
-    queue = deque([fname for fname, deg in in_degree.items() if deg == 0])
+    # Kahn's algorithm for topological sort (dependencies first)
+    queue = deque(sorted(fname for fname, deg in in_degree.items() if deg == 0))
     sorted_files = []
     while queue:
         fname = queue.popleft()
         sorted_files.append(fname)
-        for dep in adj[fname]:
-            in_degree[dep] -= 1
-            if in_degree[dep] == 0:
-                queue.append(dep)
+        for dependent in sorted(adj[fname]):
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
 
     if len(sorted_files) != len(dependency_map):
         print("[WARNING] Cycle detected or missing references; some files may not be sorted correctly.")
@@ -186,12 +187,10 @@ def topological_sort_files(dependency_map):
         remaining = set(dependency_map) - set(sorted_files)
         sorted_files.extend(remaining)
 
-    sorted = list(reversed(sorted_files))  # Reverse so dependencies come first
-
     if(DEBUG):
-        print(f"[DEBUG] Topologically sorted files: {sorted}\n")
+        print(f"[DEBUG] Topologically sorted files: {sorted_files}\n")
     
-    return sorted
+    return sorted_files
 
 
 def sample_resources_from_file(filepath, sample_size=TYPE_ORDER_SAMPLE_SIZE):
@@ -209,7 +208,7 @@ def sample_resources_from_file(filepath, sample_size=TYPE_ORDER_SAMPLE_SIZE):
                         sampled_resources.append(json.loads(line))
                     except Exception as e:
                         print(f"❌ [ERROR] Failed to parse sample from {os.path.basename(filepath)}:{line_number}: {e}")
-                    if len(sampled_resources) >= sample_size:
+                    if sample_size and sample_size > 0 and len(sampled_resources) >= sample_size:
                         break
             else:
                 sampled_resources.append(json.load(file))
@@ -217,6 +216,39 @@ def sample_resources_from_file(filepath, sample_size=TYPE_ORDER_SAMPLE_SIZE):
         print(f"❌ [ERROR] Failed to sample {os.path.basename(filepath)}: {e}")
 
     return sampled_resources
+
+
+def iter_resources_from_file(filepath, max_resources=None):
+    extension = os.path.splitext(filepath)[1].lower()
+    yielded = 0
+
+    try:
+        with open(filepath, 'r', encoding='utf-8') as file:
+            if extension == ".ndjson":
+                for line_number, line in enumerate(file, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        resource = json.loads(line)
+                    except Exception as e:
+                        print(f"❌ [ERROR] Failed to parse sample from {os.path.basename(filepath)}:{line_number}: {e}")
+                        continue
+
+                    yield resource
+                    yielded += 1
+                    if max_resources and yielded >= max_resources:
+                        return
+            else:
+                try:
+                    resource = json.load(file)
+                except Exception as e:
+                    print(f"❌ [ERROR] Failed to sample {os.path.basename(filepath)}: {e}")
+                    return
+
+                yield resource
+    except Exception as e:
+        print(f"❌ [ERROR] Failed to sample {os.path.basename(filepath)}: {e}")
 
 
 def infer_resource_types_for_file(filename, sampled_resources):
@@ -241,29 +273,39 @@ def infer_type_order(directory, sample_size=TYPE_ORDER_SAMPLE_SIZE):
     type_dependencies = {}
     all_types = []
 
-    print(f"🧭 Sampling up to {sample_size} resources per file to infer resource type order...\n")
+    if sample_size and sample_size > 0:
+        print(f"🧭 Sampling up to {sample_size} resources per file to infer resource type order...\n")
+    else:
+        print("🧭 Scanning all resources per file to infer resource type order...\n")
     for filename in files:
         filepath = os.path.join(directory, filename)
-        sampled_resources = sample_resources_from_file(filepath, sample_size=sample_size)
-        inferred_types = infer_resource_types_for_file(filename, sampled_resources)
+        max_resources = sample_size if sample_size and sample_size > 0 else None
+        inferred_types = []
+
+        for resource in iter_resources_from_file(filepath, max_resources=max_resources):
+            source_type = resource.get("resourceType")
+            if not source_type:
+                continue
+
+            if source_type not in inferred_types:
+                inferred_types.append(source_type)
+            if source_type not in all_types:
+                all_types.append(source_type)
+
+            source_dependencies = type_dependencies.setdefault(source_type, set())
+            for reference in extract_references(resource):
+                dependency_type = parse_reference_type(reference)
+                if dependency_type and dependency_type != source_type:
+                    source_dependencies.add(dependency_type)
+
         if not inferred_types:
-            continue
+            inferred_types = infer_resource_types_for_file(filename, [])
 
         for resource_type in inferred_types:
             if resource_type not in type_dependencies:
                 type_dependencies[resource_type] = set()
             if resource_type not in all_types:
                 all_types.append(resource_type)
-
-        for resource in sampled_resources:
-            source_type = resource.get("resourceType")
-            if not source_type:
-                continue
-            source_dependencies = type_dependencies.setdefault(source_type, set())
-            for reference in extract_references(resource):
-                dependency_type = parse_reference_type(reference)
-                if dependency_type and dependency_type != source_type:
-                    source_dependencies.add(dependency_type)
 
     known_types = set(all_types)
     for resource_type in list(type_dependencies.keys()):
@@ -417,7 +459,14 @@ def put_files_in_order(base_url, directory, type_order, auth=None):
         put_files_for_resource_type(base_url, directory, resource_type, auth=auth)
 
 
-def put_files(base_url, directory, auth=None, resource_type_filter=None):
+def put_files(
+    base_url,
+    directory,
+    auth=None,
+    resource_type_filter=None,
+    type_order_scan_mode=TYPE_ORDER_SCAN_MODE,
+    type_order_sample_size=TYPE_ORDER_SAMPLE_SIZE,
+):
     matching_files = list_fhir_files(directory, resource_type_filter)
     if not matching_files:
         print(f"[INFO] No files found for resource type: {resource_type_filter}")
@@ -426,7 +475,9 @@ def put_files(base_url, directory, auth=None, resource_type_filter=None):
     if resource_type_filter is None:
         ndjson_files = list_fhir_files(directory, extensions={".ndjson"})
         if ndjson_files:
-            inferred_type_order = infer_type_order(directory)
+            # Use configurable scan behavior for NDJSON type ordering.
+            sample_size = 0 if type_order_scan_mode == "full" else type_order_sample_size
+            inferred_type_order = infer_type_order(directory, sample_size=sample_size)
             if inferred_type_order:
                 put_files_in_order(base_url, directory, inferred_type_order, auth=auth)
                 print("\n🎉 Upload process complete.\n")
@@ -445,6 +496,18 @@ def main():
     parser.add_argument('--password', help='Password for basic auth')
     parser.add_argument('--type', help='Optional FHIR resource type to filter uploads (e.g. AllergyIntolerance)')
     parser.add_argument('--type-order', help='Comma-separated resource types to upload in order (e.g. Patient,Practitioner,Observation)')
+    parser.add_argument(
+        '--type-order-scan-mode',
+        choices=['sample', 'full'],
+        default='full',
+        help='How to infer NDJSON type dependencies when --type-order is not provided: sample (faster) or full (more accurate). Default: full',
+    )
+    parser.add_argument(
+        '--type-order-sample-size',
+        type=int,
+        default=TYPE_ORDER_SAMPLE_SIZE,
+        help=f'Per-file sample size for NDJSON dependency inference when --type-order-scan-mode=sample (default: {TYPE_ORDER_SAMPLE_SIZE})',
+    )
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     args = parser.parse_args()
 
@@ -454,6 +517,9 @@ def main():
     global DEBUG
     DEBUG = args.debug
 
+    if args.type_order_scan_mode == 'sample' and args.type_order_sample_size <= 0:
+        parser.error('--type-order-sample-size must be greater than 0')
+
     auth = HTTPBasicAuth(args.user, args.password) if args.user and args.password else None
     if args.type_order:
         type_order = [resource_type.strip() for resource_type in args.type_order.split(',') if resource_type.strip()]
@@ -461,7 +527,14 @@ def main():
             parser.error('--type-order must contain at least one resource type')
         put_files_in_order(args.host.rstrip("/"), args.data, type_order, auth)
     else:
-        put_files(args.host.rstrip("/"), args.data, auth, args.type)
+        put_files(
+            args.host.rstrip("/"),
+            args.data,
+            auth,
+            args.type,
+            args.type_order_scan_mode,
+            args.type_order_sample_size,
+        )
 
 if __name__ == "__main__":
     main()
