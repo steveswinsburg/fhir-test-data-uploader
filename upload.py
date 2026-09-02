@@ -182,9 +182,12 @@ def topological_sort_files(dependency_map):
                 queue.append(dependent)
 
     if len(sorted_files) != len(dependency_map):
-        print("[WARNING] Cycle detected or missing references; some files may not be sorted correctly.")
+        remaining = sorted(set(dependency_map) - set(sorted_files))
+        print(
+            "[WARNING] Cycle detected or missing references; files with unresolved dependencies: "
+            + ", ".join(remaining)
+        )
         # Add remaining files in any order
-        remaining = set(dependency_map) - set(sorted_files)
         sorted_files.extend(remaining)
 
     if(DEBUG):
@@ -358,7 +361,8 @@ def put_json_files(base_url, directory, auth=None, resource_type_filter=None):
         return 0
 
     print("🛠️  Building dependency map... \n")
-    dependency_map = build_dependency_map(directory, resource_type_filter)
+    # Index all resources so references are available while sorting filtered uploads.
+    dependency_map = build_dependency_map(directory)
     if not dependency_map:
         return 0
 
@@ -373,6 +377,8 @@ def put_json_files(base_url, directory, auth=None, resource_type_filter=None):
     for filename in sorted_files:
         meta = dependency_map[filename]
         if meta["loaded"]:
+            continue
+        if resource_type_filter is not None and meta["resourceType"] != resource_type_filter:
             continue
         if DEBUG:
             print(f"[DEBUG] Handling {filename}")
