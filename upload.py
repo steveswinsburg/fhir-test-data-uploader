@@ -1,7 +1,11 @@
 import os
+import re
+import sys
 import argparse
 import requests
 import json
+import time
+from datetime import datetime
 from requests.auth import HTTPBasicAuth
 from collections import deque
 
@@ -9,6 +13,81 @@ DEBUG = False
 NDJSON_PROGRESS_INTERVAL = 1000
 TYPE_ORDER_SAMPLE_SIZE = 5
 TYPE_ORDER_SCAN_MODE = "full"
+EXIT_CODE_INCOMPLETE = 2
+
+
+class ChunkLimitReached(Exception):
+    """Raised once --chunk-size resources have been processed in this run; progress has already been saved."""
+    pass
+
+
+class ProgressTracker:
+    """Tracks which files/resources have been uploaded so large uploads can be chunked and resumed."""
+
+    def __init__(self, progress_file, chunk_size=None):
+        self.progress_file = progress_file
+        self.chunk_size = chunk_size
+        self.processed_this_run = 0
+        self.data = self._load()
+
+    def _load(self):
+        if self.progress_file and os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, 'r', encoding='utf-8') as file:
+                    data = json.load(file)
+                data.setdefault("files", {})
+                data.setdefault("total_uploaded", 0)
+                data.setdefault("total_processed", 0)
+                data.setdefault("completed", False)
+                return data
+            except Exception as e:
+                print(f"⚠️ [WARNING] Failed to read progress file {self.progress_file}: {e}. Starting fresh.\n")
+        return {"files": {}, "total_uploaded": 0, "total_processed": 0, "completed": False}
+
+    def save(self):
+        if not self.progress_file:
+            return
+        directory = os.path.dirname(self.progress_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{self.progress_file}.tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as file:
+            json.dump(self.data, file, indent=2)
+        os.replace(tmp_path, self.progress_file)
+
+    def reset(self):
+        self.data = {"files": {}, "total_uploaded": 0, "total_processed": 0, "completed": False}
+        self.processed_this_run = 0
+        self.save()
+
+    def is_file_done(self, filename):
+        return self.data["files"].get(filename, {}).get("done", False)
+
+    def mark_file_done(self, filename):
+        self.data["files"].setdefault(filename, {})["done"] = True
+
+    def get_ndjson_resume_count(self, filename):
+        return self.data["files"].get(filename, {}).get("processed_resources", 0)
+
+    def set_ndjson_position(self, filename, processed_resources):
+        self.data["files"].setdefault(filename, {})["processed_resources"] = processed_resources
+
+    def record_result(self, uploaded):
+        self.processed_this_run += 1
+        self.data["total_processed"] += 1
+        if uploaded:
+            self.data["total_uploaded"] += 1
+
+    def should_checkpoint(self):
+        return self.data["total_processed"] % NDJSON_PROGRESS_INTERVAL == 0
+
+    def chunk_reached(self):
+        return self.chunk_size is not None and self.processed_this_run >= self.chunk_size
+
+
+def default_progress_file(data_dir, host):
+    sanitized_host = re.sub(r'[^A-Za-z0-9]+', '_', host).strip('_')
+    return os.path.join(data_dir, f".upload-progress.{sanitized_host}.json")
 
 
 def matches_resource_type_filter(filename, resource_type_filter=None):
@@ -25,7 +104,9 @@ def list_fhir_files(directory, resource_type_filter=None, extensions=None):
 
     return sorted(
         f for f in os.listdir(directory)
-        if os.path.splitext(f)[1].lower() in extensions and matches_resource_type_filter(f, resource_type_filter)
+        if not f.startswith(".")
+        and os.path.splitext(f)[1].lower() in extensions
+        and matches_resource_type_filter(f, resource_type_filter)
     )
 
 
@@ -355,7 +436,7 @@ def infer_type_order(directory, sample_size=TYPE_ORDER_SAMPLE_SIZE):
     return ordered_types
 
 
-def put_json_files(base_url, directory, auth=None, resource_type_filter=None):
+def put_json_files(base_url, directory, auth=None, resource_type_filter=None, progress=None):
     json_files = list_fhir_files(directory, resource_type_filter, extensions={".json"})
     if not json_files:
         return 0
@@ -380,6 +461,8 @@ def put_json_files(base_url, directory, auth=None, resource_type_filter=None):
             continue
         if resource_type_filter is not None and meta["resourceType"] != resource_type_filter:
             continue
+        if progress and progress.is_file_done(filename):
+            continue
         if DEBUG:
             print(f"[DEBUG] Handling {filename}")
         resource_type = meta["resourceType"]
@@ -387,25 +470,46 @@ def put_json_files(base_url, directory, auth=None, resource_type_filter=None):
         if not resource_type or not resource_id:
             print(f"⚠️ [WARNING] Skipping {filename}: Missing resourceType or id")
             continue
-        if upload_resource(base_url, meta["json_data"], auth=auth, source_label=filename):
+        ok = upload_resource(base_url, meta["json_data"], auth=auth, source_label=filename)
+        if ok:
             dependency_map[filename]["loaded"] = True
             uploaded_count += 1
+
+        if progress:
+            progress.record_result(ok)
+            if ok:
+                progress.mark_file_done(filename)
+            if progress.should_checkpoint():
+                progress.save()
+            if progress.chunk_reached():
+                progress.save()
+                print(f"⏸️  Chunk size reached after {filename}. Progress saved to {progress.progress_file}.\n")
+                raise ChunkLimitReached()
 
     return uploaded_count
 
 
-def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None):
+def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None, progress=None):
     filename = os.path.basename(filepath)
     processed = 0
     uploaded = 0
     skipped = 0
     failed = 0
+    resource_index = 0  # count of non-blank resources encountered, used as the resume marker
+    resume_from = progress.get_ndjson_resume_count(filename) if progress else 0
 
     print(f"⬆️  Uploading NDJSON file: {filename}\n")
+    if resume_from:
+        print(f"⏭️  Resuming {filename} after previously processed resource #{resume_from}\n")
+
     with open(filepath, 'r', encoding='utf-8') as file:
         for line_number, line in enumerate(file, start=1):
             line = line.strip()
             if not line:
+                continue
+
+            resource_index += 1
+            if resource_index <= resume_from:
                 continue
 
             processed += 1
@@ -414,23 +518,50 @@ def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None):
             except Exception as e:
                 failed += 1
                 print(f"❌ [ERROR] Failed to parse {filename}:{line_number}: {e}")
+                if progress:
+                    progress.set_ndjson_position(filename, resource_index)
+                    progress.record_result(uploaded=False)
+                    if progress.should_checkpoint():
+                        progress.save()
+                    if progress.chunk_reached():
+                        progress.save()
+                        print(f"⏸️  Chunk size reached while processing {filename} at resource #{resource_index}. Progress saved to {progress.progress_file}.\n")
+                        raise ChunkLimitReached()
                 continue
 
             resource_type = json_data.get("resourceType")
             if resource_type_filter and resource_type != resource_type_filter:
                 skipped += 1
+                if progress:
+                    progress.set_ndjson_position(filename, resource_index)
                 continue
 
             source_label = f"{filename}:{line_number}"
-            if upload_resource(base_url, json_data, auth=auth, source_label=source_label):
+            ok = upload_resource(base_url, json_data, auth=auth, source_label=source_label)
+            if ok:
                 uploaded += 1
             else:
                 failed += 1
+
+            if progress:
+                progress.set_ndjson_position(filename, resource_index)
+                progress.record_result(ok)
 
             if not DEBUG and processed % NDJSON_PROGRESS_INTERVAL == 0:
                 print(
                     f"[INFO] {filename}: processed={processed}, uploaded={uploaded}, failed={failed}, skipped={skipped}"
                 )
+
+            if progress:
+                if progress.should_checkpoint():
+                    progress.save()
+                if progress.chunk_reached():
+                    progress.save()
+                    print(f"⏸️  Chunk size reached while processing {filename} at resource #{resource_index}. Progress saved to {progress.progress_file}.\n")
+                    raise ChunkLimitReached()
+
+    if progress:
+        progress.mark_file_done(filename)
 
     print(
         f"[INFO] Completed {filename}: processed={processed}, uploaded={uploaded}, failed={failed}, skipped={skipped}\n"
@@ -438,31 +569,37 @@ def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None):
     return uploaded
 
 
-def put_ndjson_files(base_url, directory, auth=None, resource_type_filter=None):
+def put_ndjson_files(base_url, directory, auth=None, resource_type_filter=None, progress=None):
     ndjson_files = list_fhir_files(directory, resource_type_filter, extensions={".ndjson"})
     uploaded_count = 0
     for filename in ndjson_files:
+        if progress and progress.is_file_done(filename):
+            print(f"⏭️  Skipping {filename} (already fully uploaded)\n")
+            continue
         filepath = os.path.join(directory, filename)
-        uploaded_count += put_ndjson_file(base_url, filepath, auth=auth, resource_type_filter=resource_type_filter)
+        uploaded_count += put_ndjson_file(base_url, filepath, auth=auth, resource_type_filter=resource_type_filter, progress=progress)
     return uploaded_count
 
 
-def put_files_for_resource_type(base_url, directory, resource_type, auth=None):
+def put_files_for_resource_type(base_url, directory, resource_type, auth=None, progress=None):
     print(f"📦 Processing resource type: {resource_type}\n")
     matching_files = list_fhir_files(directory, resource_type)
     if not matching_files:
         print(f"[INFO] No files found for resource type: {resource_type}\n")
-        return
+        return 0
 
     uploaded_count = 0
-    uploaded_count += put_json_files(base_url, directory, auth=auth, resource_type_filter=resource_type)
-    uploaded_count += put_ndjson_files(base_url, directory, auth=auth, resource_type_filter=resource_type)
+    uploaded_count += put_json_files(base_url, directory, auth=auth, resource_type_filter=resource_type, progress=progress)
+    uploaded_count += put_ndjson_files(base_url, directory, auth=auth, resource_type_filter=resource_type, progress=progress)
+    return uploaded_count
 
 
-def put_files_in_order(base_url, directory, type_order, auth=None):
+def put_files_in_order(base_url, directory, type_order, auth=None, progress=None):
     print(f"📚 Uploading resources in explicit order: {', '.join(type_order)}\n")
+    total_uploaded = 0
     for resource_type in type_order:
-        put_files_for_resource_type(base_url, directory, resource_type, auth=auth)
+        total_uploaded += put_files_for_resource_type(base_url, directory, resource_type, auth=auth, progress=progress)
+    return total_uploaded
 
 
 def put_files(
@@ -472,11 +609,12 @@ def put_files(
     resource_type_filter=None,
     type_order_scan_mode=TYPE_ORDER_SCAN_MODE,
     type_order_sample_size=TYPE_ORDER_SAMPLE_SIZE,
+    progress=None,
 ):
     matching_files = list_fhir_files(directory, resource_type_filter)
     if not matching_files:
         print(f"[INFO] No files found for resource type: {resource_type_filter}")
-        return
+        return 0
 
     if resource_type_filter is None:
         ndjson_files = list_fhir_files(directory, extensions={".ndjson"})
@@ -485,14 +623,15 @@ def put_files(
             sample_size = 0 if type_order_scan_mode == "full" else type_order_sample_size
             inferred_type_order = infer_type_order(directory, sample_size=sample_size)
             if inferred_type_order:
-                put_files_in_order(base_url, directory, inferred_type_order, auth=auth)
+                total_uploaded = put_files_in_order(base_url, directory, inferred_type_order, auth=auth, progress=progress)
                 print("\n🎉 Upload process complete.\n")
-                return
+                return total_uploaded
 
-    json_uploaded = put_json_files(base_url, directory, auth=auth, resource_type_filter=resource_type_filter)
-    ndjson_uploaded = put_ndjson_files(base_url, directory, auth=auth, resource_type_filter=resource_type_filter)
+    json_uploaded = put_json_files(base_url, directory, auth=auth, resource_type_filter=resource_type_filter, progress=progress)
+    ndjson_uploaded = put_ndjson_files(base_url, directory, auth=auth, resource_type_filter=resource_type_filter, progress=progress)
 
     print("\n🎉 Upload process complete.\n")
+    return json_uploaded + ndjson_uploaded
 
 def main():
     parser = argparse.ArgumentParser(description="Upload FHIR JSON files to a server.")
@@ -514,6 +653,22 @@ def main():
         default=TYPE_ORDER_SAMPLE_SIZE,
         help=f'Per-file sample size for NDJSON dependency inference when --type-order-scan-mode=sample (default: {TYPE_ORDER_SAMPLE_SIZE})',
     )
+    parser.add_argument(
+        '--chunk-size',
+        type=int,
+        help='Opt in to chunked uploads: process at most this many resources in this run before pausing. '
+             'Progress is saved so re-running the same command resumes automatically. Without this flag, '
+             'no progress is tracked and the upload always runs start-to-finish (previous behavior).',
+    )
+    parser.add_argument(
+        '--progress-file',
+        help='Path to the progress tracking file when using --chunk-size (default: <data>/.upload-progress.<host>.json)',
+    )
+    parser.add_argument(
+        '--restart',
+        action='store_true',
+        help='Ignore any existing progress file and re-upload everything from the beginning (requires --chunk-size)',
+    )
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     args = parser.parse_args()
 
@@ -526,21 +681,88 @@ def main():
     if args.type_order_scan_mode == 'sample' and args.type_order_sample_size <= 0:
         parser.error('--type-order-sample-size must be greater than 0')
 
+    if args.chunk_size is not None and args.chunk_size <= 0:
+        parser.error('--chunk-size must be greater than 0')
+
+    if not args.chunk_size and (args.progress_file or args.restart):
+        parser.error('--progress-file and --restart require --chunk-size')
+
     auth = HTTPBasicAuth(args.user, args.password) if args.user and args.password else None
-    if args.type_order:
-        type_order = [resource_type.strip() for resource_type in args.type_order.split(',') if resource_type.strip()]
-        if not type_order:
-            parser.error('--type-order must contain at least one resource type')
-        put_files_in_order(args.host.rstrip("/"), args.data, type_order, auth)
-    else:
-        put_files(
-            args.host.rstrip("/"),
-            args.data,
-            auth,
-            args.type,
-            args.type_order_scan_mode,
-            args.type_order_sample_size,
+
+    progress = None
+    if args.chunk_size:
+        progress_file = args.progress_file or default_progress_file(args.data, args.host)
+        progress = ProgressTracker(progress_file, chunk_size=args.chunk_size)
+
+        if args.restart:
+            progress.reset()
+            print(f"🔄 Restarting upload: cleared progress file {progress_file}\n")
+        elif progress.data.get("completed"):
+            print(
+                f"✅ Progress file {progress_file} shows this upload already completed "
+                f"(total_uploaded={progress.data['total_uploaded']}). Use --restart to re-upload.\n"
+            )
+            return
+        elif progress.data["files"]:
+            print(
+                f"↩️  Resuming from progress file: {progress_file} "
+                f"(previously processed {progress.data['total_processed']}, uploaded {progress.data['total_uploaded']})\n"
+            )
+
+    start_time = datetime.now()
+    start_perf = time.perf_counter()
+    print(f"🕒 Upload started: {start_time.isoformat(timespec='seconds')}\n")
+
+    incomplete = False
+    total_uploaded = 0
+    try:
+        if args.type_order:
+            type_order = [resource_type.strip() for resource_type in args.type_order.split(',') if resource_type.strip()]
+            if not type_order:
+                parser.error('--type-order must contain at least one resource type')
+            total_uploaded = put_files_in_order(args.host.rstrip("/"), args.data, type_order, auth, progress=progress)
+        else:
+            total_uploaded = put_files(
+                args.host.rstrip("/"),
+                args.data,
+                auth,
+                args.type,
+                args.type_order_scan_mode,
+                args.type_order_sample_size,
+                progress=progress,
+            )
+    except ChunkLimitReached:
+        incomplete = True
+        total_uploaded = progress.data['total_uploaded'] if progress else total_uploaded
+    except KeyboardInterrupt:
+        print("\n⚠️ [WARNING] Interrupted by user.")
+        if progress:
+            progress.save()
+            print(f"💾 Progress saved to {progress.progress_file}. Re-run the same command to resume.\n")
+        sys.exit(130)
+
+    if progress and not incomplete:
+        progress.data["completed"] = True
+        progress.save()
+        total_uploaded = progress.data['total_uploaded']
+
+    end_time = datetime.now()
+    elapsed_seconds = time.perf_counter() - start_perf
+    total_uploaded = total_uploaded or 0
+    rate = (total_uploaded / elapsed_seconds) if elapsed_seconds > 0 else 0
+
+    print(f"🕒 Upload finished: {end_time.isoformat(timespec='seconds')}")
+    print(
+        f"📊 Uploaded {total_uploaded} record(s) in {elapsed_seconds:.2f}s "
+        f"({rate:.2f} records/sec)\n"
+    )
+
+    if incomplete:
+        print(
+            f"⏸️  Chunk size limit ({args.chunk_size}) reached before all data was uploaded. "
+            "Re-run the same command to continue from where it left off.\n"
         )
+        sys.exit(EXIT_CODE_INCOMPLETE)
 
 if __name__ == "__main__":
     main()

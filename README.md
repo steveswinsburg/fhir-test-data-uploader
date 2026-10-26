@@ -13,6 +13,7 @@ A Python utility for uploading FHIR JSON / NDJSON files to FHIR servers using PU
 - 📊 Progress reporting with status codes
 - 🔄 Automatic resource type and ID detection from filename
 - 🆔 PUT requests with specific resource IDs (not server-generated)
+- 🧩 Chunked uploads with automatic resume for very large datasets (e.g. 1M+ records)
 - 🛡️ Error handling and detailed logging
 - 🐚 Shell script wrapper for easy execution
 
@@ -139,6 +140,24 @@ The `upload.sh` script handles virtual environment setup and dependency installa
   --host http://localhost:8080/fhir \
   --debug
 
+# Upload a huge dataset (e.g. 1 million records) in resumable chunks of 10,000
+./upload.sh \
+  --data ./fhir-data \
+  --host http://localhost:8080/fhir \
+  --chunk-size 10000
+# Re-run the exact same command to continue from where it left off.
+# Keep re-running until it exits with code 0 (fully complete), e.g.:
+while true; do
+  ./upload.sh --data ./fhir-data --host http://localhost:8080/fhir --chunk-size 10000
+  [ $? -ne 2 ] && break
+done
+
+# Start over from scratch, ignoring any saved progress
+./upload.sh \
+  --data ./fhir-data \
+  --host http://localhost:8080/fhir \
+  --restart
+
 # Example with local HAPI FHIR server
 ./upload.sh --data ../au-fhir-test-data/au-core --host http://localhost:8080/fhir
 ```
@@ -188,6 +207,19 @@ python upload.py \
   --data ./fhir-data \
   --host https://your.fhir.server/fhir \
   --debug
+
+# Upload a huge dataset in resumable chunks, pausing after every 10,000 records
+python upload.py \
+  --data ./fhir-data \
+  --host https://your.fhir.server/fhir \
+  --chunk-size 10000
+# Re-run the same command to resume automatically from the saved progress file.
+
+# Ignore saved progress and re-upload everything from the start
+python upload.py \
+  --data ./fhir-data \
+  --host https://your.fhir.server/fhir \
+  --restart
 ```
 
 ### Command Line Arguments
@@ -202,11 +234,34 @@ python upload.py \
 | `--type-order` | ❌ | Comma-separated resource types to upload in order | `Patient,Practitioner,Observation` |
 | `--type-order-scan-mode` | ❌ | NDJSON dependency inference mode when `--type-order` is not provided: `full` (default) or `sample` | `sample` |
 | `--type-order-sample-size` | ❌ | Per-file sample size used when `--type-order-scan-mode=sample` | `1000` |
+| `--chunk-size` | ❌ | Opt in to chunked uploads: max resources to process per run before pausing; enables progress tracking/resume | `10000` |
+| `--progress-file` | ❌ | Path to the progress tracking file when using `--chunk-size` (default: `<data>/.upload-progress.<host>.json`) | `./progress.json` |
+| `--restart` | ❌ | Ignore any existing progress file and re-upload everything from the start (requires `--chunk-size`) | `--restart` |
 | `--debug` | ❌ | Enable verbose debug logging | `--debug` |
 
 Notes:
 - `--type` and `--type-order` cannot be used together.
 - `--type-order-sample-size` must be greater than `0` when `--type-order-scan-mode=sample`.
+- `--progress-file` and `--restart` require `--chunk-size`; without `--chunk-size`, no progress is tracked and the upload always runs start-to-finish (previous behavior).
+
+## 🧩 Chunked Uploads & Resume (Large Datasets)
+
+For very large datasets (e.g. 1 million+ records), uploading everything in a single run can take a long time and is risky if interrupted. This is **opt-in**: by default (no `--chunk-size`), the uploader behaves exactly as before — no progress file is created and the upload always runs start-to-finish. Pass `--chunk-size` to enable chunking and progress tracking:
+
+- **`--chunk-size N`**: stop after processing `N` resources and save progress. The process exits with status code `2` to indicate more work remains, or `0` once everything is uploaded.
+- **Automatic resume**: simply re-run the exact same command (still with `--chunk-size`) — it picks up exactly where it left off (per NDJSON file, by resource count; per individual JSON file, by filename).
+- **Progress file**: by default stored at `<data>/.upload-progress.<host>.json`. Override the location with `--progress-file`.
+- **`--restart`**: ignore any saved progress and start the upload from scratch.
+- Progress is also checkpointed periodically (every 1000 records) during a run, so an unexpected crash or `Ctrl+C` still allows resuming without reprocessing everything.
+
+Example — upload 1 million records in chunks of 10,000, looping automatically until complete:
+
+```bash
+while true; do
+  ./upload.sh --data ./fhir-data --host http://localhost:8080/fhir --chunk-size 10000
+  [ $? -ne 2 ] && break
+done
+```
 
 ### Shell Script Features
 
