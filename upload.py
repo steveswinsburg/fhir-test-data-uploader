@@ -152,7 +152,7 @@ def parse_reference_type(reference):
     return resource_type
 
 
-def upload_resource(base_url, json_data, auth=None, source_label=None):
+def upload_resource(base_url, json_data, session, source_label=None):
     resource_type = json_data.get("resourceType")
     resource_id = json_data.get("id")
 
@@ -162,11 +162,13 @@ def upload_resource(base_url, json_data, auth=None, source_label=None):
 
     url = f"{base_url}/{resource_type}/{resource_id}"
     try:
-        response = requests.put(
+        # Using the shared session keeps the underlying TCP/TLS connection alive across
+        # requests (HTTP keep-alive) instead of reconnecting for every single resource,
+        # which otherwise dominates per-record latency on high-RTT/VPN network paths.
+        response = session.put(
             url,
             json=json_data,
             headers={"Content-Type": "application/fhir+json"},
-            auth=auth
         )
     except Exception as e:
         print(f"❌ [ERROR] Failed to PUT {source_label or f'{resource_type}/{resource_id}'}: {e}")
@@ -436,7 +438,7 @@ def infer_type_order(directory, sample_size=TYPE_ORDER_SAMPLE_SIZE):
     return ordered_types
 
 
-def put_json_files(base_url, directory, auth=None, resource_type_filter=None, progress=None):
+def put_json_files(base_url, directory, session, resource_type_filter=None, progress=None):
     json_files = list_fhir_files(directory, resource_type_filter, extensions={".json"})
     if not json_files:
         return 0
@@ -470,7 +472,7 @@ def put_json_files(base_url, directory, auth=None, resource_type_filter=None, pr
         if not resource_type or not resource_id:
             print(f"⚠️ [WARNING] Skipping {filename}: Missing resourceType or id")
             continue
-        ok = upload_resource(base_url, meta["json_data"], auth=auth, source_label=filename)
+        ok = upload_resource(base_url, meta["json_data"], session, source_label=filename)
         if ok:
             dependency_map[filename]["loaded"] = True
             uploaded_count += 1
@@ -489,7 +491,7 @@ def put_json_files(base_url, directory, auth=None, resource_type_filter=None, pr
     return uploaded_count
 
 
-def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None, progress=None):
+def put_ndjson_file(base_url, filepath, session, resource_type_filter=None, progress=None):
     filename = os.path.basename(filepath)
     processed = 0
     uploaded = 0
@@ -537,7 +539,7 @@ def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None, pr
                 continue
 
             source_label = f"{filename}:{line_number}"
-            ok = upload_resource(base_url, json_data, auth=auth, source_label=source_label)
+            ok = upload_resource(base_url, json_data, session, source_label=source_label)
             if ok:
                 uploaded += 1
             else:
@@ -569,7 +571,7 @@ def put_ndjson_file(base_url, filepath, auth=None, resource_type_filter=None, pr
     return uploaded
 
 
-def put_ndjson_files(base_url, directory, auth=None, resource_type_filter=None, progress=None):
+def put_ndjson_files(base_url, directory, session, resource_type_filter=None, progress=None):
     ndjson_files = list_fhir_files(directory, resource_type_filter, extensions={".ndjson"})
     uploaded_count = 0
     for filename in ndjson_files:
@@ -577,11 +579,11 @@ def put_ndjson_files(base_url, directory, auth=None, resource_type_filter=None, 
             print(f"⏭️  Skipping {filename} (already fully uploaded)\n")
             continue
         filepath = os.path.join(directory, filename)
-        uploaded_count += put_ndjson_file(base_url, filepath, auth=auth, resource_type_filter=resource_type_filter, progress=progress)
+        uploaded_count += put_ndjson_file(base_url, filepath, session, resource_type_filter=resource_type_filter, progress=progress)
     return uploaded_count
 
 
-def put_files_for_resource_type(base_url, directory, resource_type, auth=None, progress=None):
+def put_files_for_resource_type(base_url, directory, resource_type, session, progress=None):
     print(f"📦 Processing resource type: {resource_type}\n")
     matching_files = list_fhir_files(directory, resource_type)
     if not matching_files:
@@ -589,23 +591,23 @@ def put_files_for_resource_type(base_url, directory, resource_type, auth=None, p
         return 0
 
     uploaded_count = 0
-    uploaded_count += put_json_files(base_url, directory, auth=auth, resource_type_filter=resource_type, progress=progress)
-    uploaded_count += put_ndjson_files(base_url, directory, auth=auth, resource_type_filter=resource_type, progress=progress)
+    uploaded_count += put_json_files(base_url, directory, session, resource_type_filter=resource_type, progress=progress)
+    uploaded_count += put_ndjson_files(base_url, directory, session, resource_type_filter=resource_type, progress=progress)
     return uploaded_count
 
 
-def put_files_in_order(base_url, directory, type_order, auth=None, progress=None):
+def put_files_in_order(base_url, directory, type_order, session, progress=None):
     print(f"📚 Uploading resources in explicit order: {', '.join(type_order)}\n")
     total_uploaded = 0
     for resource_type in type_order:
-        total_uploaded += put_files_for_resource_type(base_url, directory, resource_type, auth=auth, progress=progress)
+        total_uploaded += put_files_for_resource_type(base_url, directory, resource_type, session, progress=progress)
     return total_uploaded
 
 
 def put_files(
     base_url,
     directory,
-    auth=None,
+    session,
     resource_type_filter=None,
     type_order_scan_mode=TYPE_ORDER_SCAN_MODE,
     type_order_sample_size=TYPE_ORDER_SAMPLE_SIZE,
@@ -623,12 +625,12 @@ def put_files(
             sample_size = 0 if type_order_scan_mode == "full" else type_order_sample_size
             inferred_type_order = infer_type_order(directory, sample_size=sample_size)
             if inferred_type_order:
-                total_uploaded = put_files_in_order(base_url, directory, inferred_type_order, auth=auth, progress=progress)
+                total_uploaded = put_files_in_order(base_url, directory, inferred_type_order, session, progress=progress)
                 print("\n🎉 Upload process complete.\n")
                 return total_uploaded
 
-    json_uploaded = put_json_files(base_url, directory, auth=auth, resource_type_filter=resource_type_filter, progress=progress)
-    ndjson_uploaded = put_ndjson_files(base_url, directory, auth=auth, resource_type_filter=resource_type_filter, progress=progress)
+    json_uploaded = put_json_files(base_url, directory, session, resource_type_filter=resource_type_filter, progress=progress)
+    ndjson_uploaded = put_ndjson_files(base_url, directory, session, resource_type_filter=resource_type_filter, progress=progress)
 
     print("\n🎉 Upload process complete.\n")
     return json_uploaded + ndjson_uploaded
@@ -689,6 +691,12 @@ def main():
 
     auth = HTTPBasicAuth(args.user, args.password) if args.user and args.password else None
 
+    # A shared Session reuses the underlying TCP/TLS connection (HTTP keep-alive) across all
+    # uploads in this run instead of reconnecting per-request, which otherwise dominates
+    # per-record latency on high-RTT/VPN network paths.
+    session = requests.Session()
+    session.auth = auth
+
     progress = None
     if args.chunk_size:
         progress_file = args.progress_file or default_progress_file(args.data, args.host)
@@ -720,12 +728,12 @@ def main():
             type_order = [resource_type.strip() for resource_type in args.type_order.split(',') if resource_type.strip()]
             if not type_order:
                 parser.error('--type-order must contain at least one resource type')
-            total_uploaded = put_files_in_order(args.host.rstrip("/"), args.data, type_order, auth, progress=progress)
+            total_uploaded = put_files_in_order(args.host.rstrip("/"), args.data, type_order, session, progress=progress)
         else:
             total_uploaded = put_files(
                 args.host.rstrip("/"),
                 args.data,
-                auth,
+                session,
                 args.type,
                 args.type_order_scan_mode,
                 args.type_order_sample_size,
@@ -740,6 +748,8 @@ def main():
             progress.save()
             print(f"💾 Progress saved to {progress.progress_file}. Re-run the same command to resume.\n")
         sys.exit(130)
+    finally:
+        session.close()
 
     if progress and not incomplete:
         progress.data["completed"] = True
