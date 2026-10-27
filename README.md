@@ -158,6 +158,12 @@ done
   --host http://localhost:8080/fhir \
   --restart
 
+# Upload NDJSON resources with concurrent workers for higher throughput
+./upload.sh \
+  --data ./fhir-data \
+  --host http://localhost:8080/fhir \
+  --concurrency 8
+
 # Example with local HAPI FHIR server
 ./upload.sh --data ../au-fhir-test-data/au-core --host http://localhost:8080/fhir
 ```
@@ -220,6 +226,12 @@ python upload.py \
   --data ./fhir-data \
   --host https://your.fhir.server/fhir \
   --restart
+
+# Upload NDJSON resources with concurrent workers for higher throughput
+python upload.py \
+  --data ./fhir-data \
+  --host https://your.fhir.server/fhir \
+  --concurrency 8
 ```
 
 ### Command Line Arguments
@@ -237,6 +249,7 @@ python upload.py \
 | `--chunk-size` | ❌ | Opt in to chunked uploads: max resources to process per run before pausing; enables progress tracking/resume | `10000` |
 | `--progress-file` | ❌ | Path to the progress tracking file when using `--chunk-size` (default: `<data>/.upload-progress.<host>.json`) | `./progress.json` |
 | `--restart` | ❌ | Ignore any existing progress file and re-upload everything from the start (requires `--chunk-size`) | `--restart` |
+| `--concurrency` | ❌ | Number of concurrent upload workers for NDJSON resources (default: `1`, sequential). Only used when a resource type has no same-type references (e.g. `Organization.partOf`); otherwise falls back to sequential automatically | `8` |
 | `--debug` | ❌ | Enable verbose debug logging | `--debug` |
 
 Notes:

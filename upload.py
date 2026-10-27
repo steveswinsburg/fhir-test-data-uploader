@@ -5,6 +5,8 @@ import argparse
 import requests
 import json
 import time
+import threading
+import concurrent.futures
 from datetime import datetime
 from requests.auth import HTTPBasicAuth
 from collections import deque
@@ -583,7 +585,122 @@ def put_ndjson_files(base_url, directory, session, resource_type_filter=None, pr
     return uploaded_count
 
 
-def put_files_for_resource_type(base_url, directory, resource_type, session, progress=None):
+def ndjson_type_has_self_references(directory, resource_type):
+    """
+    Scan every NDJSON resource of resource_type for a reference pointing to another
+    resource of the SAME type (e.g. Organization.partOf, Location.partOf,
+    Observation.partOf/hasMember). If any are found, upload order between individual
+    resources of this type matters and concurrent upload cannot be proven safe, so the
+    caller should fall back to sequential processing for this type.
+    """
+    ndjson_files = list_fhir_files(directory, resource_type, extensions={".ndjson"})
+    for filename in ndjson_files:
+        filepath = os.path.join(directory, filename)
+        for resource in iter_resources_from_file(filepath):
+            if resource.get("resourceType") != resource_type:
+                continue
+            for reference in extract_references(resource):
+                if parse_reference_type(reference) == resource_type:
+                    return True
+    return False
+
+
+def collect_ndjson_resources_for_type(directory, resource_type, progress=None):
+    """
+    Flatten every not-yet-uploaded NDJSON resource of resource_type (across all of its
+    NDJSON files) into a list of (resource_key, json_data) tuples, ready for concurrent
+    dispatch. resource_key is used both as a log label and as the resumability marker
+    (tracked by individual resource rather than by file position, since concurrent
+    uploads complete out of order).
+    """
+    ndjson_files = list_fhir_files(directory, resource_type, extensions={".ndjson"})
+    completed = set(progress.data.get("completed_resources", [])) if progress else set()
+    resources = []
+    for filename in ndjson_files:
+        filepath = os.path.join(directory, filename)
+        for index, resource in enumerate(iter_resources_from_file(filepath), start=1):
+            resource_id = resource.get("id")
+            resource_key = f"{filename}:{resource_type}/{resource_id}" if resource_id else f"{filename}:{index}"
+            if resource_key in completed:
+                continue
+            resources.append((resource_key, resource))
+    return resources
+
+
+def put_ndjson_resources_concurrently(base_url, directory, resource_type, session, concurrency, progress=None):
+    """
+    Upload all NDJSON resources of resource_type using a bounded thread pool. Only called
+    once ndjson_type_has_self_references() has confirmed no same-type references exist,
+    so resources of this type can be safely uploaded in any order/concurrently.
+    """
+    resources = collect_ndjson_resources_for_type(directory, resource_type, progress=progress)
+    if not resources:
+        return 0
+
+    print(
+        f"⚡ Uploading {len(resources)} {resource_type} resource(s) with up to {concurrency} "
+        "concurrent workers (no same-type references detected)...\n"
+    )
+
+    uploaded_count = 0
+    lock = threading.Lock()
+    chunk_stop = False
+
+    def do_upload(resource_key, json_data):
+        ok = upload_resource(base_url, json_data, session, source_label=resource_key)
+        return resource_key, ok
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        index = 0
+        total = len(resources)
+        while index < total and not chunk_stop:
+            batch = resources[index:index + concurrency]
+            index += len(batch)
+            futures = [executor.submit(do_upload, *item) for item in batch]
+            for future in concurrent.futures.as_completed(futures):
+                resource_key, ok = future.result()
+                with lock:
+                    if ok:
+                        uploaded_count += 1
+                    if progress:
+                        progress.record_result(ok)
+                        if ok:
+                            progress.data.setdefault("completed_resources", []).append(resource_key)
+                        if progress.should_checkpoint():
+                            progress.save()
+                        if progress.chunk_reached():
+                            chunk_stop = True
+
+    if progress and chunk_stop:
+        progress.save()
+        print(
+            f"⏸️  Chunk size reached while concurrently uploading {resource_type}. "
+            f"Progress saved to {progress.progress_file}.\n"
+        )
+        raise ChunkLimitReached()
+
+    return uploaded_count
+
+
+def upload_ndjson_for_type(base_url, directory, resource_type, session, progress=None, concurrency=1):
+    """
+    Dispatches NDJSON upload for a single resource type: concurrently when a worker
+    count > 1 was requested and a same-type reference scan confirms it's safe, otherwise
+    falls back to the existing sequential, position-resumable path.
+    """
+    if concurrency > 1 and resource_type and not ndjson_type_has_self_references(directory, resource_type):
+        return put_ndjson_resources_concurrently(base_url, directory, resource_type, session, concurrency, progress=progress)
+
+    if concurrency > 1 and resource_type:
+        print(
+            f"⚠️  [INFO] {resource_type} contains same-type references (e.g. partOf/hasMember); "
+            "uploading sequentially for correctness.\n"
+        )
+
+    return put_ndjson_files(base_url, directory, session, resource_type_filter=resource_type, progress=progress)
+
+
+def put_files_for_resource_type(base_url, directory, resource_type, session, progress=None, concurrency=1):
     print(f"📦 Processing resource type: {resource_type}\n")
     matching_files = list_fhir_files(directory, resource_type)
     if not matching_files:
@@ -592,15 +709,15 @@ def put_files_for_resource_type(base_url, directory, resource_type, session, pro
 
     uploaded_count = 0
     uploaded_count += put_json_files(base_url, directory, session, resource_type_filter=resource_type, progress=progress)
-    uploaded_count += put_ndjson_files(base_url, directory, session, resource_type_filter=resource_type, progress=progress)
+    uploaded_count += upload_ndjson_for_type(base_url, directory, resource_type, session, progress=progress, concurrency=concurrency)
     return uploaded_count
 
 
-def put_files_in_order(base_url, directory, type_order, session, progress=None):
+def put_files_in_order(base_url, directory, type_order, session, progress=None, concurrency=1):
     print(f"📚 Uploading resources in explicit order: {', '.join(type_order)}\n")
     total_uploaded = 0
     for resource_type in type_order:
-        total_uploaded += put_files_for_resource_type(base_url, directory, resource_type, session, progress=progress)
+        total_uploaded += put_files_for_resource_type(base_url, directory, resource_type, session, progress=progress, concurrency=concurrency)
     return total_uploaded
 
 
@@ -612,6 +729,7 @@ def put_files(
     type_order_scan_mode=TYPE_ORDER_SCAN_MODE,
     type_order_sample_size=TYPE_ORDER_SAMPLE_SIZE,
     progress=None,
+    concurrency=1,
 ):
     matching_files = list_fhir_files(directory, resource_type_filter)
     if not matching_files:
@@ -625,12 +743,12 @@ def put_files(
             sample_size = 0 if type_order_scan_mode == "full" else type_order_sample_size
             inferred_type_order = infer_type_order(directory, sample_size=sample_size)
             if inferred_type_order:
-                total_uploaded = put_files_in_order(base_url, directory, inferred_type_order, session, progress=progress)
+                total_uploaded = put_files_in_order(base_url, directory, inferred_type_order, session, progress=progress, concurrency=concurrency)
                 print("\n🎉 Upload process complete.\n")
                 return total_uploaded
 
     json_uploaded = put_json_files(base_url, directory, session, resource_type_filter=resource_type_filter, progress=progress)
-    ndjson_uploaded = put_ndjson_files(base_url, directory, session, resource_type_filter=resource_type_filter, progress=progress)
+    ndjson_uploaded = upload_ndjson_for_type(base_url, directory, resource_type_filter, session, progress=progress, concurrency=concurrency)
 
     print("\n🎉 Upload process complete.\n")
     return json_uploaded + ndjson_uploaded
@@ -660,7 +778,10 @@ def main():
         type=int,
         help='Opt in to chunked uploads: process at most this many resources in this run before pausing. '
              'Progress is saved so re-running the same command resumes automatically. Without this flag, '
-             'no progress is tracked and the upload always runs start-to-finish (previous behavior).',
+             'no progress is tracked and the upload always runs start-to-finish (previous behavior). '
+             'When combined with --concurrency > 1, the cutoff is approximate: an in-flight batch of up '
+             'to --concurrency resources is allowed to finish rather than being cancelled mid-flight, so '
+             'a run may upload up to (concurrency - 1) more resources than --chunk-size before pausing.',
     )
     parser.add_argument(
         '--progress-file',
@@ -670,6 +791,16 @@ def main():
         '--restart',
         action='store_true',
         help='Ignore any existing progress file and re-upload everything from the beginning (requires --chunk-size)',
+    )
+    parser.add_argument(
+        '--concurrency',
+        type=int,
+        default=1,
+        help='Number of concurrent upload workers for NDJSON resources (default: 1, sequential). '
+             'Only applied to a resource type\'s NDJSON resources when a same-type-reference scan '
+             '(e.g. Organization.partOf, Observation.hasMember) confirms concurrent upload is safe; '
+             'otherwise that type falls back to sequential uploads automatically. JSON individual '
+             'files and cross-type ordering always remain sequential.',
     )
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     args = parser.parse_args()
@@ -689,6 +820,9 @@ def main():
     if not args.chunk_size and (args.progress_file or args.restart):
         parser.error('--progress-file and --restart require --chunk-size')
 
+    if args.concurrency <= 0:
+        parser.error('--concurrency must be greater than 0')
+
     auth = HTTPBasicAuth(args.user, args.password) if args.user and args.password else None
 
     # A shared Session reuses the underlying TCP/TLS connection (HTTP keep-alive) across all
@@ -696,6 +830,13 @@ def main():
     # per-record latency on high-RTT/VPN network paths.
     session = requests.Session()
     session.auth = auth
+
+    if args.concurrency > 1:
+        # Size the connection pool to match the worker count so concurrent requests reuse
+        # distinct pooled connections instead of contending for (or repeatedly opening) one.
+        adapter = requests.adapters.HTTPAdapter(pool_connections=args.concurrency, pool_maxsize=args.concurrency)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
 
     progress = None
     if args.chunk_size:
@@ -728,7 +869,7 @@ def main():
             type_order = [resource_type.strip() for resource_type in args.type_order.split(',') if resource_type.strip()]
             if not type_order:
                 parser.error('--type-order must contain at least one resource type')
-            total_uploaded = put_files_in_order(args.host.rstrip("/"), args.data, type_order, session, progress=progress)
+            total_uploaded = put_files_in_order(args.host.rstrip("/"), args.data, type_order, session, progress=progress, concurrency=args.concurrency)
         else:
             total_uploaded = put_files(
                 args.host.rstrip("/"),
@@ -738,6 +879,7 @@ def main():
                 args.type_order_scan_mode,
                 args.type_order_sample_size,
                 progress=progress,
+                concurrency=args.concurrency,
             )
     except ChunkLimitReached:
         incomplete = True
