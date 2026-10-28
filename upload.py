@@ -30,6 +30,7 @@ class ProgressTracker:
         self.progress_file = progress_file
         self.chunk_size = chunk_size
         self.processed_this_run = 0
+        self.uploaded_this_run = 0
         self.data = self._load()
 
     def _load(self):
@@ -60,6 +61,7 @@ class ProgressTracker:
     def reset(self):
         self.data = {"files": {}, "total_uploaded": 0, "total_processed": 0, "completed": False}
         self.processed_this_run = 0
+        self.uploaded_this_run = 0
         self.save()
 
     def is_file_done(self, filename):
@@ -79,6 +81,7 @@ class ProgressTracker:
         self.data["total_processed"] += 1
         if uploaded:
             self.data["total_uploaded"] += 1
+            self.uploaded_this_run += 1
 
     def should_checkpoint(self):
         return self.data["total_processed"] % NDJSON_PROGRESS_INTERVAL == 0
@@ -883,7 +886,7 @@ def main():
             )
     except ChunkLimitReached:
         incomplete = True
-        total_uploaded = progress.data['total_uploaded'] if progress else total_uploaded
+        total_uploaded = progress.uploaded_this_run if progress else total_uploaded
     except KeyboardInterrupt:
         print("\n⚠️ [WARNING] Interrupted by user.")
         if progress:
@@ -896,7 +899,7 @@ def main():
     if progress and not incomplete:
         progress.data["completed"] = True
         progress.save()
-        total_uploaded = progress.data['total_uploaded']
+        total_uploaded = progress.uploaded_this_run
 
     end_time = datetime.now()
     elapsed_seconds = time.perf_counter() - start_perf
@@ -908,6 +911,11 @@ def main():
         f"📊 Uploaded {total_uploaded} record(s) in {elapsed_seconds:.2f}s "
         f"({rate:.2f} records/sec)\n"
     )
+    if progress and progress.data['total_uploaded'] != total_uploaded:
+        print(
+            f"ℹ️  Lifetime total for this progress file: {progress.data['total_uploaded']} record(s) "
+            "(includes earlier runs resumed from this progress file).\n"
+        )
 
     if incomplete:
         print(
