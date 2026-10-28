@@ -256,6 +256,7 @@ Notes:
 - `--type` and `--type-order` cannot be used together.
 - `--type-order-sample-size` must be greater than `0` when `--type-order-scan-mode=sample`.
 - `--progress-file` and `--restart` require `--chunk-size`; without `--chunk-size`, no progress is tracked and the upload always runs start-to-finish (previous behavior).
+- With `--concurrency` > 1, many workers can write to the same FHIR resource type at once. The underlying database may occasionally abort one side of a write/write conflict (e.g. a Postgres deadlock) under high concurrency; the uploader detects this and automatically retries the affected PUT with exponential backoff, since the original write was rolled back and is safe to resend. If retries are exhausted the resource is logged as failed and the run continues. If this happens frequently, try a lower `--concurrency` value.
 
 ## 🧩 Chunked Uploads & Resume (Large Datasets)
 

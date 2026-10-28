@@ -4,6 +4,7 @@ import sys
 import argparse
 import requests
 import json
+import random
 import time
 import threading
 import concurrent.futures
@@ -16,6 +17,17 @@ NDJSON_PROGRESS_INTERVAL = 1000
 TYPE_ORDER_SAMPLE_SIZE = 5
 TYPE_ORDER_SCAN_MODE = "full"
 EXIT_CODE_INCOMPLETE = 2
+TRANSIENT_DB_CONFLICT_MAX_RETRIES = 4
+TRANSIENT_DB_CONFLICT_BASE_DELAY_SECONDS = 0.5
+# Substrings seen in HAPI FHIR OperationOutcome diagnostics when the underlying database
+# aborted the write due to transient write/write contention rather than a real data problem.
+# These are safe to retry as-is since the original write was rolled back, not partially applied.
+TRANSIENT_DB_CONFLICT_MARKERS = (
+    "deadlock detected",
+    "LockAcquisitionException",
+    "could not serialize access",
+    "CannotAcquireLockException",
+)
 
 
 class ChunkLimitReached(Exception):
@@ -187,6 +199,16 @@ def parse_reference_type(reference):
     return resource_type
 
 
+def is_transient_db_conflict(response_text):
+    """
+    True when a failed response looks like a transient database write/write conflict
+    (e.g. a Postgres deadlock between two concurrent inserts) rather than a real data
+    or validation problem. The original write was rolled back by the database in this
+    case, so retrying the identical PUT is safe.
+    """
+    return any(marker in response_text for marker in TRANSIENT_DB_CONFLICT_MARKERS)
+
+
 def upload_resource(base_url, json_data, session, source_label=None):
     resource_type = json_data.get("resourceType")
     resource_id = json_data.get("id")
@@ -196,29 +218,45 @@ def upload_resource(base_url, json_data, session, source_label=None):
         return False
 
     url = f"{base_url}/{resource_type}/{resource_id}"
-    request_start = time.perf_counter()
-    try:
-        # Using the shared session keeps the underlying TCP/TLS connection alive across
-        # requests (HTTP keep-alive) instead of reconnecting for every single resource,
-        # which otherwise dominates per-record latency on high-RTT/VPN network paths.
-        response = session.put(
-            url,
-            json=json_data,
-            headers={"Content-Type": "application/fhir+json"},
-        )
-    except Exception as e:
-        print(f"❌ [ERROR] Failed to PUT {source_label or f'{resource_type}/{resource_id}'}: {e}")
+    label = source_label or f"{resource_type}/{resource_id}"
+
+    attempt = 0
+    while True:
+        request_start = time.perf_counter()
+        try:
+            # Using the shared session keeps the underlying TCP/TLS connection alive across
+            # requests (HTTP keep-alive) instead of reconnecting for every single resource,
+            # which otherwise dominates per-record latency on high-RTT/VPN network paths.
+            response = session.put(
+                url,
+                json=json_data,
+                headers={"Content-Type": "application/fhir+json"},
+            )
+        except Exception as e:
+            print(f"❌ [ERROR] Failed to PUT {label}: {e}")
+            return False
+        finally:
+            UPLOAD_TIMER.record(request_start, time.perf_counter())
+
+        if DEBUG:
+            print(f"✅ [INFO] PUT {label} to {url} - Status: {response.status_code}")
+
+        if response.ok:
+            return True
+
+        if attempt < TRANSIENT_DB_CONFLICT_MAX_RETRIES and is_transient_db_conflict(response.text):
+            delay = TRANSIENT_DB_CONFLICT_BASE_DELAY_SECONDS * (2 ** attempt) + random.uniform(0, 0.25)
+            attempt += 1
+            print(
+                f"⚠️  [RETRY] Transient database conflict for {label} "
+                f"(attempt {attempt}/{TRANSIENT_DB_CONFLICT_MAX_RETRIES}); retrying in {delay:.1f}s...\n"
+            )
+            time.sleep(delay)
+            continue
+
+        print(f"❌ [ERROR] Response for {label}: {response.text}")
         return False
-    finally:
-        UPLOAD_TIMER.record(request_start, time.perf_counter())
 
-    if DEBUG:
-        print(f"✅ [INFO] PUT {source_label or f'{resource_type}/{resource_id}'} to {url} - Status: {response.status_code}")
-
-    if not response.ok:
-        print(f"❌ [ERROR] Response for {source_label or f'{resource_type}/{resource_id}'}: {response.text}")
-
-    return response.ok
 
 def build_dependency_map(directory, resource_type_filter=None):
     """
