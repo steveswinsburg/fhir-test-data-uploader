@@ -23,6 +23,36 @@ class ChunkLimitReached(Exception):
     pass
 
 
+class UploadTimer:
+    """
+    Tracks wall-clock time actually spent sending/receiving upload requests, separate from
+    setup work (building dependency maps, topologically sorting files, inferring NDJSON type
+    order) that runs before the first resource is ever uploaded. That setup phase can take a
+    noticeable amount of time on large datasets, and including it in the reported records/sec
+    rate understates real upload throughput.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.first_request_at = None
+        self.last_response_at = None
+
+    def record(self, start, end):
+        with self._lock:
+            if self.first_request_at is None or start < self.first_request_at:
+                self.first_request_at = start
+            if self.last_response_at is None or end > self.last_response_at:
+                self.last_response_at = end
+
+    def elapsed_seconds(self):
+        if self.first_request_at is None or self.last_response_at is None:
+            return 0.0
+        return self.last_response_at - self.first_request_at
+
+
+UPLOAD_TIMER = UploadTimer()
+
+
 class ProgressTracker:
     """Tracks which files/resources have been uploaded so large uploads can be chunked and resumed."""
 
@@ -166,6 +196,7 @@ def upload_resource(base_url, json_data, session, source_label=None):
         return False
 
     url = f"{base_url}/{resource_type}/{resource_id}"
+    request_start = time.perf_counter()
     try:
         # Using the shared session keeps the underlying TCP/TLS connection alive across
         # requests (HTTP keep-alive) instead of reconnecting for every single resource,
@@ -178,6 +209,8 @@ def upload_resource(base_url, json_data, session, source_label=None):
     except Exception as e:
         print(f"❌ [ERROR] Failed to PUT {source_label or f'{resource_type}/{resource_id}'}: {e}")
         return False
+    finally:
+        UPLOAD_TIMER.record(request_start, time.perf_counter())
 
     if DEBUG:
         print(f"✅ [INFO] PUT {source_label or f'{resource_type}/{resource_id}'} to {url} - Status: {response.status_code}")
@@ -902,14 +935,21 @@ def main():
         total_uploaded = progress.uploaded_this_run
 
     end_time = datetime.now()
-    elapsed_seconds = time.perf_counter() - start_perf
+    total_elapsed_seconds = time.perf_counter() - start_perf
+    upload_elapsed_seconds = UPLOAD_TIMER.elapsed_seconds()
     total_uploaded = total_uploaded or 0
-    rate = (total_uploaded / elapsed_seconds) if elapsed_seconds > 0 else 0
+    # Rate is based on time actually spent uploading (first request sent to last response
+    # received), excluding upfront setup work such as building dependency maps, topologically
+    # sorting files, or inferring NDJSON type order - that setup can take a while on large
+    # datasets and isn't part of real upload throughput.
+    rate = (total_uploaded / upload_elapsed_seconds) if upload_elapsed_seconds > 0 else 0
 
     print(f"🕒 Upload finished: {end_time.isoformat(timespec='seconds')}")
+    setup_elapsed_seconds = max(total_elapsed_seconds - upload_elapsed_seconds, 0)
     print(
-        f"📊 Uploaded {total_uploaded} record(s) in {elapsed_seconds:.2f}s "
-        f"({rate:.2f} records/sec)\n"
+        f"🧮 Setup (dependency mapping/sorting/type-order inference): {setup_elapsed_seconds:.2f}s\n"
+        f"📊 Uploaded {total_uploaded} record(s) in {upload_elapsed_seconds:.2f}s of actual upload time "
+        f"({rate:.2f} records/sec); total run time {total_elapsed_seconds:.2f}s\n"
     )
     if progress and progress.data['total_uploaded'] != total_uploaded:
         print(
