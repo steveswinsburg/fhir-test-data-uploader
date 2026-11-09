@@ -118,6 +118,28 @@ class ProgressTracker:
     def set_ndjson_position(self, filename, processed_resources):
         self.data["files"].setdefault(filename, {})["processed_resources"] = processed_resources
 
+    def get_failed_indices(self, filename):
+        """Resource indices within this NDJSON file that failed on a previous run and
+        must be retried on resume, even though they are behind the resume position."""
+        return set(self.data["files"].get(filename, {}).get("failed_indices", []))
+
+    def record_failed_index(self, filename, index):
+        entry = self.data["files"].setdefault(filename, {})
+        indices = set(entry.get("failed_indices", []))
+        indices.add(index)
+        entry["failed_indices"] = sorted(indices)
+
+    def clear_failed_index(self, filename, index):
+        entry = self.data["files"].get(filename)
+        if not entry or "failed_indices" not in entry:
+            return
+        indices = set(entry["failed_indices"])
+        indices.discard(index)
+        entry["failed_indices"] = sorted(indices)
+
+    def has_pending_failures(self, filename):
+        return bool(self.data["files"].get(filename, {}).get("failed_indices"))
+
     def record_result(self, uploaded):
         self.processed_this_run += 1
         self.data["total_processed"] += 1
@@ -239,7 +261,8 @@ def upload_resource(base_url, json_data, session, source_label=None):
             UPLOAD_TIMER.record(request_start, time.perf_counter())
 
         if DEBUG:
-            print(f"✅ [INFO] PUT {label} to {url} - Status: {response.status_code}")
+            status_icon = "✅" if response.ok else "❌"
+            print(f"{status_icon} [INFO] PUT {label} to {url} - Status: {response.status_code}")
 
         if response.ok:
             return True
@@ -575,10 +598,16 @@ def put_ndjson_file(base_url, filepath, session, resource_type_filter=None, prog
     failed = 0
     resource_index = 0  # count of non-blank resources encountered, used as the resume marker
     resume_from = progress.get_ndjson_resume_count(filename) if progress else 0
+    # Resources that failed on a previous run must be retried even though their index is
+    # behind resume_from - otherwise a transient failure (e.g. a DB failover mid-upload)
+    # would be silently treated as done forever, since resume_from only ever moves forward.
+    failed_indices = progress.get_failed_indices(filename) if progress else set()
 
     print(f"⬆️  Uploading NDJSON file: {filename}\n")
     if resume_from:
         print(f"⏭️  Resuming {filename} after previously processed resource #{resume_from}\n")
+    if failed_indices:
+        print(f"🔁 Retrying {len(failed_indices)} previously failed resource(s) in {filename}\n")
 
     with open(filepath, 'r', encoding='utf-8') as file:
         for line_number, line in enumerate(file, start=1):
@@ -587,7 +616,7 @@ def put_ndjson_file(base_url, filepath, session, resource_type_filter=None, prog
                 continue
 
             resource_index += 1
-            if resource_index <= resume_from:
+            if resource_index <= resume_from and resource_index not in failed_indices:
                 continue
 
             processed += 1
@@ -598,6 +627,7 @@ def put_ndjson_file(base_url, filepath, session, resource_type_filter=None, prog
                 print(f"❌ [ERROR] Failed to parse {filename}:{line_number}: {e}")
                 if progress:
                     progress.set_ndjson_position(filename, resource_index)
+                    progress.record_failed_index(filename, resource_index)
                     progress.record_result(uploaded=False)
                     if progress.should_checkpoint():
                         progress.save()
@@ -623,6 +653,10 @@ def put_ndjson_file(base_url, filepath, session, resource_type_filter=None, prog
 
             if progress:
                 progress.set_ndjson_position(filename, resource_index)
+                if ok:
+                    progress.clear_failed_index(filename, resource_index)
+                else:
+                    progress.record_failed_index(filename, resource_index)
                 progress.record_result(ok)
 
             if not DEBUG and processed % NDJSON_PROGRESS_INTERVAL == 0:
@@ -639,7 +673,13 @@ def put_ndjson_file(base_url, filepath, session, resource_type_filter=None, prog
                     raise ChunkLimitReached()
 
     if progress:
-        progress.mark_file_done(filename)
+        # Never mark a file "done" while it still has unresolved failures - that would make
+        # it get skipped entirely ("already fully uploaded") on every future resume, silently
+        # treating failed resources as if they had succeeded.
+        if progress.has_pending_failures(filename):
+            print(f"⚠️  [WARNING] {filename} still has resource(s) that failed to upload; it will be retried on the next resume.\n")
+        else:
+            progress.mark_file_done(filename)
 
     print(
         f"[INFO] Completed {filename}: processed={processed}, uploaded={uploaded}, failed={failed}, skipped={skipped}\n"
