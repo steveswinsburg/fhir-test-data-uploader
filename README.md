@@ -267,6 +267,7 @@ For very large datasets (e.g. 1 million+ records), uploading everything in a sin
 - **Progress file**: by default stored at `<data>/.upload-progress.<host>.json`. Override the location with `--progress-file`.
 - **`--restart`**: ignore any saved progress and start the upload from scratch.
 - Progress is also checkpointed periodically (every 1000 records) during a run, so an unexpected crash or `Ctrl+C` still allows resuming without reprocessing everything.
+- **Failed resources are never recorded as uploaded.** If a PUT returns a non-success response (e.g. a transient database error or a brief DB failover), that resource is tracked separately as failed; the NDJSON file it belongs to is not marked complete and a resume will automatically retry just that resource, even though the rest of the file has already moved on.
 
 Example — upload 1 million records in chunks of 10,000, looping automatically until complete:
 
