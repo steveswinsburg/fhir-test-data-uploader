@@ -42,12 +42,19 @@ class UploadTimer:
     order) that runs before the first resource is ever uploaded. That setup phase can take a
     noticeable amount of time on large datasets, and including it in the reported records/sec
     rate understates real upload throughput.
+
+    Also tracks the per-request duration of every PUT (request sent to response received,
+    successful or not), so a latency percentile (e.g. the 90th) can be reported alongside the
+    aggregate throughput rate - needed to assess single-transaction NFRs such as "update
+    transactions complete within 3 seconds for at least 90% of transactions", which the
+    aggregate records/sec rate alone cannot demonstrate.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self.first_request_at = None
         self.last_response_at = None
+        self.durations = []
 
     def record(self, start, end):
         with self._lock:
@@ -55,11 +62,29 @@ class UploadTimer:
                 self.first_request_at = start
             if self.last_response_at is None or end > self.last_response_at:
                 self.last_response_at = end
+            self.durations.append(end - start)
 
     def elapsed_seconds(self):
         if self.first_request_at is None or self.last_response_at is None:
             return 0.0
         return self.last_response_at - self.first_request_at
+
+    def percentile(self, p):
+        """Nearest-rank percentile (p in [0, 100]) over recorded per-request durations."""
+        with self._lock:
+            durations = sorted(self.durations)
+        if not durations:
+            return None
+        rank = max(0, min(len(durations) - 1, int(round(p / 100 * len(durations))) - 1))
+        return durations[rank]
+
+    def fraction_at_or_below(self, threshold_seconds):
+        """Fraction (0-1) of recorded per-request durations at or below the given threshold."""
+        with self._lock:
+            durations = list(self.durations)
+        if not durations:
+            return None
+        return sum(1 for d in durations if d <= threshold_seconds) / len(durations)
 
 
 UPLOAD_TIMER = UploadTimer()
@@ -917,6 +942,14 @@ def main():
              'files and cross-type ordering always remain sequential.',
     )
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument(
+        '--latency-threshold-seconds',
+        type=float,
+        default=3.0,
+        help='Per-request PUT response-time threshold (seconds) used to report the percentage of '
+             'update transactions completing at or below it, alongside the p50/p90/p99/max latency '
+             'summary (default: 3.0, matching a typical single-update-transaction NFR).',
+    )
     args = parser.parse_args()
 
     if args.type and args.type_order:
@@ -936,6 +969,9 @@ def main():
 
     if args.concurrency <= 0:
         parser.error('--concurrency must be greater than 0')
+
+    if args.latency_threshold_seconds <= 0:
+        parser.error('--latency-threshold-seconds must be greater than 0')
 
     auth = HTTPBasicAuth(args.user, args.password) if args.user and args.password else None
 
@@ -1029,6 +1065,21 @@ def main():
         f"📊 Uploaded {total_uploaded} record(s) in {upload_elapsed_seconds:.2f}s of actual upload time "
         f"({rate:.2f} records/sec); total run time {total_elapsed_seconds:.2f}s\n"
     )
+
+    p50 = UPLOAD_TIMER.percentile(50)
+    p90 = UPLOAD_TIMER.percentile(90)
+    p99 = UPLOAD_TIMER.percentile(99)
+    max_duration = UPLOAD_TIMER.percentile(100)
+    fraction_within = UPLOAD_TIMER.fraction_at_or_below(args.latency_threshold_seconds)
+    if p50 is not None:
+        threshold = args.latency_threshold_seconds
+        pct_within = fraction_within * 100
+        verdict = "✅ meets" if pct_within >= 90 else "❌ below"
+        print(
+            f"⏱️  Per-request PUT latency: p50={p50:.3f}s, p90={p90:.3f}s, p99={p99:.3f}s, max={max_duration:.3f}s\n"
+            f"🎯 {pct_within:.2f}% of requests completed within {threshold:.1f}s "
+            f"({verdict} the \u226590% within {threshold:.1f}s threshold)\n"
+        )
     if progress and progress.data['total_uploaded'] != total_uploaded:
         print(
             f"ℹ️  Lifetime total for this progress file: {progress.data['total_uploaded']} record(s) "

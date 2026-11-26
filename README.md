@@ -11,6 +11,7 @@ A Python utility for uploading FHIR JSON / NDJSON files to FHIR servers using PU
 - 🧭 Automatic resource-type order inference from references (full scan by default, sampling optional)
 - 📚 Explicit resource-type upload ordering for dependency-sensitive loads
 - 📊 Progress reporting with status codes
+- ⏱️ Per-request latency summary (p50/p90/p99/max, % within a configurable threshold)
 - 🔄 Automatic resource type and ID detection from filename
 - 🆔 PUT requests with specific resource IDs (not server-generated)
 - 🧩 Chunked uploads with automatic resume for very large datasets (e.g. 1M+ records)
@@ -257,6 +258,19 @@ Notes:
 - `--type-order-sample-size` must be greater than `0` when `--type-order-scan-mode=sample`.
 - `--progress-file` and `--restart` require `--chunk-size`; without `--chunk-size`, no progress is tracked and the upload always runs start-to-finish (previous behavior).
 - With `--concurrency` > 1, many workers can write to the same FHIR resource type at once. The underlying database may occasionally abort one side of a write/write conflict (e.g. a Postgres deadlock) under high concurrency; the uploader detects this and automatically retries the affected PUT with exponential backoff, since the original write was rolled back and is safe to resend. If retries are exhausted the resource is logged as failed and the run continues. If this happens frequently, try a lower `--concurrency` value.
+
+## ⏱️ Per-Request Latency Summary
+
+Alongside the aggregate `records/sec` throughput rate, every run reports a per-request PUT latency summary at the end:
+
+```
+⏱️  Per-request PUT latency: p50=0.045s, p90=0.512s, p99=1.203s, max=2.871s
+🎯 93.40% of requests completed within 3.0s (✅ meets the ≥90% within 3.0s threshold)
+```
+
+Each PUT's wall-clock duration (request sent to response received, successful or not) is recorded independently of the aggregate `records/sec` rate, which only reflects total throughput and can look healthy even if individual requests are occasionally slow. This is needed to assess single-transaction requirements such as "update transactions complete within N seconds for at least 90% of transactions" — a threshold the aggregate rate alone cannot demonstrate. Use `--latency-threshold-seconds` to change the threshold (default `3.0`); it has no effect on upload behavior, only on this summary.
+
+To get meaningful latency figures under a representative load, run the uploader concurrently with any other traffic (e.g. a search load test) the requirement specifies, rather than in isolation.
 
 ## 🧩 Chunked Uploads & Resume (Large Datasets)
 
