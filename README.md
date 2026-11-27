@@ -17,6 +17,7 @@ A Python utility for uploading FHIR JSON / NDJSON files to FHIR servers using PU
 - 🧩 Chunked uploads with automatic resume for very large datasets (e.g. 1M+ records)
 - 🛡️ Error handling and detailed logging
 - 🐚 Shell script wrapper for easy execution
+- 🗑️ Companion `delete.py`/`delete.sh` script for cleaning up test data by ID prefix, with reference-aware retry handling
 
 ## 📋 Prerequisites
 
@@ -321,6 +322,52 @@ The inferred order should usually handle this automatically, but a common manual
 4. `Encounter` resources
 5. `Observation`, `AllergyIntolerance`, `Condition` resources
 6. Other dependent resources
+
+## 🗑️ Deleting Test Data
+
+`delete.py` (with its `delete.sh` wrapper) removes resources from a FHIR server whose `id` starts with a given prefix — handy for cleaning up test data you uploaded with `upload.py` (which uses a predictable ID naming scheme, e.g. `example-healthconnect-*`).
+
+```bash
+# Preview what would be deleted, without deleting anything
+./delete.sh \
+  --host https://your.fhir.server/fhir \
+  --user yourusername --password yourpassword \
+  --types Provenance,PractitionerRole,HealthcareService,Endpoint,Location,Practitioner,Organization \
+  --dry-run
+
+# Actually delete it (prompts for confirmation unless --yes is given)
+./delete.sh \
+  --host https://your.fhir.server/fhir \
+  --user yourusername --password yourpassword \
+  --types Provenance,PractitionerRole,HealthcareService,Endpoint,Location,Practitioner,Organization
+```
+
+### Command Line Arguments
+
+| Argument | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `--host` | ✅ | Base URL of FHIR server (include `/fhir`) | `http://localhost:8080/fhir` |
+| `--types` | ✅ | Comma-separated resource types to search and delete, in dependency order (see below) | `Patient,Observation` |
+| `--prefix` | ❌ | Delete resources whose `id` starts with this prefix (default: `example-healthconnect-`) | `test-data-` |
+| `--user` | ❌ | Username for Basic Authentication | `admin` |
+| `--password` | ❌ | Password for Basic Authentication | `password123` |
+| `--page-size` | ❌ | Resources to search for per request (default: `100`). Each type is searched in a **single** request, not paginated — if a type has more matching resources than this, raise `--page-size` so the one request covers all of them | `1000` |
+| `--dry-run` | ❌ | List matching resources without deleting them | `--dry-run` |
+| `--yes` | ❌ | Skip the confirmation prompt before deleting | `--yes` |
+| `--ignore-references` | ❌ | Cascade-delete resources that still reference the one being deleted (HAPI FHIR only, see below) | `--ignore-references` |
+| `--debug` | ❌ | Enable verbose debug logging | `--debug` |
+
+### How deletion works
+
+- No resource-type discovery and no pagination: you must explicitly list every `--types` you want searched, and each type is searched with a single request (`_count=<page-size>`).
+- Within each type, matching resources are deleted **one at a time**, with a log line per resource (`📌` found, `🗑️` deleted), so you can see exactly what's being removed as it happens.
+- **Handling references between resources:** FHIR servers commonly reject (`409 Conflict`) deleting a resource that's still referenced by another (e.g. a `Location` whose `partOf` points at it, or a `PractitionerRole` referencing a `Practitioner`). `delete.py` handles this two ways, which can be used independently or together:
+  1. **Retry rounds (always on):** if a resource fails to delete, it's held back and retried again once everything else in that same batch has had a chance to go first. This repeats, round after round, as long as *something* succeeds each round — which naturally clears same-type hierarchies (e.g. a chain of `Organization.partOf` references) leaf-first, without needing to know the hierarchy up front. If a full round makes no progress at all, the remaining resources are reported as failures (likely referenced by something outside your `--types`/`--prefix` scope) and the script exits with status code `1`.
+  2. **`--ignore-references` (opt-in, HAPI FHIR only):** sends the `X-Cascade: delete` header on every DELETE, which tells a HAPI FHIR server to delete anything still referencing the target resource instead of rejecting the request. This only works if the server has cascading deletes enabled (`allow_cascading_deletes: true` in the HAPI starter config) — if it's disabled server-side, the header is silently ignored and deletes will still fail with `409`.
+- **`--types` order matters for cross-type references** (the retry logic only re-orders deletes *within* a type, not across types). List referencing types before the types they reference, e.g. for HealthConnect test data:
+  ```
+  Provenance,PractitionerRole,HealthcareService,Endpoint,Location,Practitioner,Organization
+  ```
 
 ## ⚠️ Important Notes
 
